@@ -1,0 +1,37 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+venv_*/
+python/
+python313/
+torch_hub/
+
+# --- 数据 / 模型权重 / 生成物（不进仓库）---
+data/
+train_data/
+
+# 训练数据里的音频与谱面：保留 train/ 目录本身，但忽略大文件
+train/**/*.ogg
+train/**/*.mp3
+train/**/*.wav
+train/**/*.adofai
+train/**/*.npy
+
+# 其它生成/缓存产物
+*.npy
+*.wav
+*.mp3
+*.png
+
+# --- 日志 ---
+*.log
+*.out
+
+# --- 系统 ---
+.DS_Store
+Thumbs.db
