@@ -26,7 +26,8 @@
 adofai-diffusion/
 ├── run.bat              # Windows 一键启动（首次会自动建环境装依赖）
 ├── requirements.txt     # Python 依赖清单
-├── README.md            # 本文件
+├── README.md            # 本文件（中文）
+├── README_EN.md         # 英文文档
 ├── LICENSE              # MIT 许可证
 ├── .gitignore
 ├── train/               # 放你自己的训练数据（结构见 train/README.md），不进 git
@@ -140,6 +141,19 @@ venv\Scripts\python.exe app\training\train_stage2.py
 代码**不包含**训练好的权重（`onset_net.pt` / `vae.pt` / `ddpm.pt`）。
 原因：权重是从训练数据学出来的，而训练数据（歌曲 + 谱面）有版权，不适合随代码公开。
 请按上面的"训练"步骤用自己的数据训出来；训好后放 `data/checkpoints/` 即可。
+
+---
+
+## 想要现成的离线整合包（不用自己配环境）
+
+懒得装 Python / CUDA / 训模型？有一个**开箱即用的离线整合包**——一个自带运行时的单文件压缩包（约 3.3 GB），里面已经打包好了 Python、CUDA 版 PyTorch、Demucs 分离权重，以及三个训好的模型权重。解压双击 `run.bat` 就能用。
+
+- **需要**：Windows + NVIDIA 独显（整合包里是 CUDA 版 torch，没有 CPU 兜底）。
+- **获取方式**：加我们的 QQ 群，在群文件里下载：
+  - **QQ 群：`1027673321`**
+- 解压后进 `new_last_128_piano/portable/`，双击 `run.bat`，浏览器自动开 `http://127.0.0.1:8081`。
+
+> 本仓库开源的源码就是同一套管线；整合包只是额外把运行时 + 训好的权重塞进去，让不懂编程的人也能直接用。
 
 ---
 
