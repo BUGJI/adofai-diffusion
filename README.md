@@ -1,4 +1,4 @@
-# ADOFAI Maker 128
+# ADOFAI_Diffusion
 
 一个**从音乐自动生成 ADOFAI 谱面**的开源项目。
 
