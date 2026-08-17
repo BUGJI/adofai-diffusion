@@ -18,6 +18,8 @@
 
 > 注：当前版本**不生成**运镜/变色/闪光等视觉特效，只做"脚步"（踩点 + 旋转）。后续更新会先在群内测试再开源
 
+<img width="600" height="600" alt="image" src="https://github.com/user-attachments/assets/84e4fb65-1ff4-43f2-8d3b-f80c11d1b6e1" />
+
 ---
 
 ## 快速开始
