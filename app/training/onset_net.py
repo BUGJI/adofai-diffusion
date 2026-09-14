@@ -52,7 +52,7 @@ def normalize_mel(mel: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def predict_onset_frames(model, mel_np, thr: float = 0.3, min_dist: int = 2,
-                         thr_local: float = 0.3, local_win: int = 64,
+                         thr_local: float = 0.15, local_win: int = 64,
                          device: str = "cpu"):
     """用训练好的 OnsetNet 从多通道 log-mel 预测 onset 帧下标列表。
 
@@ -68,25 +68,50 @@ def predict_onset_frames(model, mel_np, thr: float = 0.3, min_dist: int = 2,
         x = torch.from_numpy(mel_np.astype("float32"))[None, None]      # (1,1,128,T)
     else:
         x = torch.from_numpy(mel_np.astype("float32"))[None]            # (1,C,128,T)
-    x = normalize_mel(x).to(device)
+    x = normalize_mel(x)
     model = model.to(device).eval()
-    logits = model(x)[0]                     # (T,)
-    prob = torch.sigmoid(logits).cpu().numpy().astype("float32")
-    T = prob.shape[0]
+    T = x.shape[-1]
+    # GPU 分块推理：超长歌整首塞 GPU 会爆显存/触发 illegal memory access（8/17+8/23 实证的坑）。
+    # 切成 CHUNK 长度片段分别跑 GPU，拼接结果与整首一致；CPU 则直接整首(无需分块)。
+    CHUNK = 4000  # ~23s@128网格(5.8ms/帧)，显存可控
+    if device.startswith("cuda") and T > CHUNK:
+        prob_chunks = []
+        with torch.no_grad():
+            for s in range(0, T, CHUNK):
+                xe = x[..., s:s + CHUNK].to(device)
+                logits = model(xe)[0]
+                prob_chunks.append(torch.sigmoid(logits).cpu())
+                del xe, logits
+        prob = torch.cat(prob_chunks, dim=0).numpy().astype("float32")
+        del prob_chunks
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+    else:
+        x = x.to(device)
+        with torch.no_grad():
+            logits = model(x)[0]                     # (T,)
+        prob = torch.sigmoid(logits).cpu().numpy().astype("float32")
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
     # 峰值提取：全局相对阈值保最强段，额外叠加【滑动窗口局部相对阈值】，
     # 避免中段弱奏被全局最强段(peak)压制成 0.3×peak 而整段被吞（"中段跳踩好多"的根因）。
     peak = float(prob.max())
     if peak < 1e-6:
         return [], prob
-    th_global = max(thr * peak, 0.04)
+    th_global = max(thr * peak, 0.02 * peak)
     win = max(8, int(local_win))
     frames, last = [], -10 ** 9
     for f in range(1, T - 1):
         if prob[f] >= prob[f - 1] and prob[f] > prob[f + 1]:
-            # 局部窗口峰值 -> 局部自适应阈值（静音段仍被 0.04 下限拦住）
+            # 分级动态阈值：只在【弱段】放宽，强段维持原 0.04 严厉不引噪声。
+            # 局部能量比 = win_peak / 全局peak：
+            #   <0.3 视为弱段(尾奏/开头衰减/间奏) -> 下限=0.01*win_peak 大幅放宽，让中等音头露出来
+            #   >=0.3 视为强段(主歌/高潮)        -> 下限=0.04 保持原严厉
             lo, hi = max(0, f - win), min(T, f + win + 1)
             win_peak = float(prob[lo:hi].max())
-            th_local = max(thr_local * win_peak, 0.04)
+            local_ratio = win_peak / peak if peak > 1e-6 else 0.0
+            floor_local = 0.01 * win_peak if local_ratio < 0.3 else 0.04
+            th_local = max(thr_local * win_peak, floor_local)
             # 取全局/局部较松者：全局峰值全保留 + 局部显著峰补回中段漏检
             if prob[f] > th_global or prob[f] > th_local:
                 if f - last < min_dist:

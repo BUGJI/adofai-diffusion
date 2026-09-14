@@ -77,18 +77,27 @@ def _f1(pred, gt, tol, hop_ms=HOP_MS_ONSET):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train_dir", default=r"D:/Users/Windows/Desktop/train")
+    ap.add_argument("--train_dir", default=str(ROOT / "train_single" / "melody"))
     ap.add_argument("--n", type=int, default=6, help="评测前 N 首")
     ap.add_argument("--tol", type=int, default=4, help="容差帧数(±, hop128网格≈±23ms)")
-    ap.add_argument("--ckpt", default=str(ROOT / "data" / "checkpoints" / "onset_net_demucs.pt"))
+    ap.add_argument("--ckpt", default=str(ROOT / "data" / "checkpoints" / "onset_net.pt"))
     a = ap.parse_args()
 
     pairs = []
-    for d in glob.glob(a.train_dir + "/*/"):
-        og = sorted(glob.glob(d + "*.ogg") + glob.glob(d + "*.mp3"))
-        ad = sorted(glob.glob(d + "*.adofai"))
-        if og and ad:
-            pairs.append((og[0], ad[0]))
+    for name in sorted(os.listdir(a.train_dir)):
+        d = os.path.join(a.train_dir, name)
+        if not os.path.isdir(d):
+            continue
+        auds = [f for f in os.listdir(d)
+                if f.lower().endswith(('.ogg', '.mp3', '.wav'))]
+        ads = [f for f in os.listdir(d) if f.lower().endswith('.adofai')]
+        if not auds or not ads:
+            continue
+        # 优先级 ogg > mp3 > wav（与原 ogg/mp3 优先行为一致，且方括号安全）
+        def _pri(f):
+            return {'ogg': 0, 'mp3': 1, 'wav': 2}.get(f.lower().rsplit('.', 1)[-1], 3)
+        auds.sort(key=_pri)
+        pairs.append((os.path.join(d, auds[0]), os.path.join(d, sorted(ads)[0])))
     pairs = pairs[:a.n]
 
     net = None

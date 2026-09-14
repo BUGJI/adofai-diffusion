@@ -22,9 +22,12 @@ from dataset import DenseChartDataset
 from vae import ChartVAE
 from diffusion import DDPM
 from device_util import get_safe_device
+from paths import train_ckpt_dir
 
-TRAIN_DIR = os.environ.get("ADOFAI_TRAIN_DIR", "D:/Users/Windows/Desktop/train")
-OUT_DIR = os.environ.get("ADOFAI_DATA_DIR", str(ROOT / "data")) + "/checkpoints"
+TRAIN_DIR = os.environ.get("ADOFAI_TRAIN_DIR", str(ROOT / "train"))
+# 训练输出统一写 train_ckpt_dir()（运行时目录优先；便携 data/checkpoints 只放出厂权重，
+# 不再被训练覆盖——此前 env/便携两套入口会各写各的，权重互相看不到）。
+OUT_DIR = str(train_ckpt_dir())
 BATCH = 8
 VAE_EPOCHS = int(os.environ.get("VAE_EPOCHS", 60))
 DDPM_EPOCHS = int(os.environ.get("DDPM_EPOCHS", 120))

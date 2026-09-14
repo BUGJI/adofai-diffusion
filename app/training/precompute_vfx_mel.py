@@ -5,8 +5,8 @@
       避免训练时数据集构建卡在某一首、且能打印每首形状/错误便于定位。
 
 用法：
-  python precompute_vfx_mel.py --data D:/ADOFAI_AI_Mug/vision/best \
-       --cache D:/ADOFAI_AI_Mug/new_last_128/portable/data/vfx_cache
+  python precompute_vfx_mel.py --data "<视觉数据根: 每子文件夹一首 .adofai+音频>"
+  （--cache 缺省 项目根/data/vfx_cache）
 """
 from __future__ import annotations
 import os, sys, glob, time, argparse
@@ -23,8 +23,10 @@ from demucs_mel import demucs_mel
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default=r"D:/ADOFAI_AI_Mug/vision/best")
-    ap.add_argument("--cache", default=r"D:/ADOFAI_AI_Mug/new_last_128/portable/data/vfx_cache")
+    ap.add_argument("--data", default=str(ROOT / "train_vfx"),
+                    help="视觉训练数据根(每子文件夹一首: .adofai+音频); 缺省 项目根/train_vfx")
+    ap.add_argument("--cache", default=str(ROOT / "data" / "vfx_cache"),
+                    help="mel 缓存目录; 缺省 项目根/data/vfx_cache")
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     data_dir = a.data

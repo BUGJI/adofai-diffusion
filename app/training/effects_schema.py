@@ -454,14 +454,26 @@ def extract_params(et, obj):
     return vec
 
 
+# ── 协调轨道色板 ────────────────────────────────────────────────────────
+# 用户反馈模型自由吐的 HSV 全范围色杂乱/刺眼。这里把 ColorTrack/RecolorTrack
+# 的颜色吸到一组和谐、常用的 ADOFAI 风格色相（霓虹感、互不冲突），
+# 仍由模型预测的 hue 选择色相、sat/val 微调强度，保证多样且好看。
+# （不影响"自由发挥"——色相仍由模型决定，只是落到和谐调色板而非随机乱色。）
 # ── 生成：归一化参数向量 -> 合法 ADOFAI action（正确字段名）─────────────
-def build_action(name, vec3, intensity, mag=1.0, ease_idx=0, filt_idx=0, disable=False):
+def _rng_angle(seed_key):
+    """确定性伪随机角 [0, 2π)：同一 seed 永远返回同一角度。
+    用于 MoveCamera 方向合成（训练端 vec[1] 只学了幅度，方向未学习）。
+    与 apply_vfx 里 SetFilter 滤镜采样同款先例（np.random.default_rng(seed)）。"""
+    return float(np.random.default_rng(int(seed_key) & 0xFFFFFFFF).uniform(0.0, 2.0 * math.pi))
+
+
+def build_action(name, vec3, intensity, mag=1.0, ease_idx=0, filt_idx=0, disable=False, seed_key=0):
     """vec3: [mag, spatial, rotation]（模型预测，归一化）。
     intensity: 0~1（本版固定 1.0 = 不限制幅度，模型自由发挥）；mag: 音乐强度系数。
     ease_idx: 缓动词表索引（模型学得的缓动）；filt_idx: 滤镜白名单索引（模型学得的滤镜）。
+    seed_key: 确定性种子（一般传帧号），驱动 MoveCamera 方向合成等"未学习维度"的稳定伪随机。
     返回合法 action dict（使用 ADOFAI 官方字段名），或 None（不注入）。"""
     I = float(np.clip(intensity, 0.0, 1.0))
-    m = float(np.clip(mag, 0.4, 1.6))
     v0, v1, v2 = (float(x) for x in vec3[:3])
     _e = EASING[int(np.clip(ease_idx, 0, len(EASING) - 1))]
     _ft = FILTER_TYPES[int(np.clip(filt_idx, 0, len(FILTER_TYPES) - 1))]
@@ -520,10 +532,23 @@ def build_action(name, vec3, intensity, mag=1.0, ease_idx=0, filt_idx=0, disable
     if name == "MoveCamera":
         # 逆变换还原物理量，幅度由模型自由决定，不设人为上限
         z = max(0.0, 100.0 + _clip(v0, -1.0, 1.0) * _ZOOM_CAP)   # 百分比整数(<100放大,>100缩小)
-        p = _clip(v1, -1.0, 1.0) * _POS_CAP                       # 位置幅度(tile)
+        # 位置：训练端 vec[1] 只编码幅度(_vec2_mag)，方向从未被学习。
+        # 旧版 [p,p] 同值克隆 -> 只能沿对角线、且永不为 0（无法表达回中）。
+        # 现幅度用 v1（可表达 ≈0 的回中，语料 63% 的 position 正是 [0,0]），
+        # 方向用确定性伪随机角（按帧种子，同帧结果稳定，与滤镜采样同款先例），
+        # 让非零运镜方向有变化而非全部同向。
+        r = _clip(v1, 0.0, 1.0) * _POS_CAP
+        ang = _rng_angle(seed_key)
+        px = r * math.cos(ang)
+        py = r * math.sin(ang)
         rot = _clip(v2, -1, 1) * _ROT_CAP
+        # relativeTo="Player"（2026-09 用户反馈"镜头不能始终保持在当前踩的轨道上"）：
+        # 真机 CameraController 里 "Tile" 会 followMode=false 把相机锚死在某格、
+        # 不再跟随行星，之后镜头就停在原地不动；"Player" 才是跟随行星模式
+        # （语料 2592 显式 Player + 2976 缺省继承=Player，占绝对主流）。
+        # 运镜一律 Player：相机永远跟着当前行星走，position 是跟随下的偏移量。
         return {"eventType": "MoveCamera", "duration": 0.5,
-                "relativeTo": "Tile", "position": [round(p, 3), round(p, 3)],
+                "relativeTo": "Player", "position": [round(px, 3), round(py, 3)],
                 "rotation": round(rot, 2), "zoom": round(z, 1),
                 "ease": _e, "enabled": True}
     if name == "Flash":

@@ -44,15 +44,20 @@ def compute_note_times(angle_data, settings, actions, add_offset=False, return_d
     ----
     angle_data : list[float]   每格绝对角；999 = mid-spin（中途旋转格，不耗时）
     settings   : dict          需含 'bpm'(float), 'pitch'(int, 会 /100), 'offset'(int)
-    actions    : list[dict]    每个事件含 'eventType','floor' 及事件字段
-    add_offset : bool          为 True 时所有时间加上 settings['offset']
+    actions    : list[dict]    每个事件含 'eventType','floor' 及事件字段；
+                               floor 为原生 .adofai 约定(0-based, 即 tile 序号):
+                               floor F 作用于离开 tile F 的那条弧 = parsed[F]
+    add_offset : bool          为 True 时把「关卡时间」换算成「歌曲时间」（真相公式，见下）
 
     返回
     ----
     list[(time_ms, is_hold)]，长度 = len(angle_data) + 1
       - 索引 0..N-1 对应 tile 0..N-1 的到达时间
       - 索引 N 是尾部哨兵（tile N-1 -> 结束标记）的到达时间，生成时一般不校验
-      - 不含 offset 时为"关卡时间"；add_offset=True 时为相对歌曲开头的实际时间
+      - 不含 offset 时为"关卡时间"（行星出生=0，出生后先转 1 拍 count-in）；
+        add_offset=True 时为【歌曲时间】= 关卡时间 - 1拍 + offset
+        （v2 点击测试 4/4 实证: 音乐在关卡时间 1拍-offset 处开始播放,
+          见 train_label_audit/11_true_model.md）
     """
     pitch = float(settings.get('pitch', 100)) / 100.0
     base_bpm = float(settings.get('bpm', 100))
@@ -77,11 +82,29 @@ def compute_note_times(angle_data, settings, actions, add_offset=False, return_d
     for ev in actions:
         et = ev.get('eventType')
         fl = ev.get('floor', 0)
-        # 与真实 ADOFAI 计时引擎一致：floor F 的 Twirl 翻转的是「离开 F 进入 F+1」
-        # 那段的转向，即引擎里索引 F 的 tile 方向，故事件落在 parsed[fl]（0-based）。
-        # （2026-08-16 修正：v9 误改成 parsed[fl-1] 导致每个 Twirl 整体错后一格，
-        # 表现为「开头旋转多一个/少一个、后面全反」。已还原为 0-based。）
-        if not (0 <= fl < len(parsed)):
+        # 原生 .adofai 事件 floor 是 0-based(= tile 序号): floor F 作用于
+        # parsed[F](离开 tile F 的那条弧), 事件触发时刻 = times[F-1](tile F
+        # 到达瞬间)。源码证据(两条独立来源一致):
+        #   1) ADOFAI-JS createTiles: actionsByFloor 以原始 event.floor 为键,
+        #      tile i 取 actionsByFloor.get(i); Twirl 计数在 parseAngle(
+        #      angleData, i, ...) 之前自增 —— Twirl@floor F 翻转的是"离开
+        #      tile F 的弧"(iteration i=F)。
+        #   2) AutoCat LoadMap.java: floorNum=floor-1 仅作 map 键; 但循环第
+        #      n 轮计算的是"绕 tile n+1 的轨道角"(now=angleData[n],
+        #      next=angleData[n+1]), twirl 翻转发生在该轮角度计算之前 ——
+        #      Twirl@floor F 翻转第 F-1 轮 = 绕 tile F 的轨道, 与键的 -1
+        #      恰好抵消, 净效果同为 0-based。
+        # 故 floor 0(出生格的离开弧)合法且被采纳; floor>=N(末端 tile 无离开
+        # 弧/越界)无计时意义, 直接跳过。
+        # 注: 旧注释曾据 onset 仲裁实验判 1-based —— 该实验的 pooled 统计被
+        # onset 检测的 downbeat 偏置污染, 已被上述源码证据推翻。此前"改成
+        # 0-based 反而错后一格"的实验只改了引擎读侧, 训练标签(_events_by_floor)
+        # 与发射侧(dense_to_adofai)仍是 1-based, 半迁移导致错位, 非结论。
+        try:
+            fl = int(fl)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= fl < n):
             continue
         ob = parsed[fl]
         if et == 'SetSpeed':
@@ -148,7 +171,14 @@ def compute_note_times(angle_data, settings, actions, add_offset=False, return_d
         directions.append(ob['direction'])
 
     if add_offset:
-        note_time = [(t + offset, h) for (t, h) in note_time]
+        # —— 真相公式(v2 点击测试 4/4 实证) ——
+        # 音乐在关卡时间「1拍 - offset」处开始播放:
+        #   歌曲时间 = 关卡时间 - 1拍 + offset
+        # 1拍 = 60000/(bpm × pitch/100)。旧版 "+offset" 轴比真相恒晚 1拍(bpm 相关),
+        # 标签整体偏晚; 由 dense_to_adofai 侧同步修正(旧轴标签 + 旧轴出谱 互相抵消,
+        # 两处必须同一步修, 否则对不齐)。见 train_label_audit/11_true_model.md。
+        beat_ms = 60000.0 / max(1e-9, base_bpm * pitch)
+        note_time = [(t - beat_ms + offset, h) for (t, h) in note_time]
     if return_directions:
         return note_time, directions
     return note_time
@@ -157,10 +187,12 @@ def compute_note_times(angle_data, settings, actions, add_offset=False, return_d
 def solve_offset(angle_data, timestamps, actions, base_bpm=120.0, pitch=100):
     """
     给定 angleData + 每格 SetSpeed + 时间戳，反推让 tile i 恰好落在 timestamps[i] 的 offset。
-    忠实于引擎：offset = timestamps[0]*1000 - note_time_level[0]。
+    忠实于引擎(真相公式: 歌曲时间 = 关卡时间 - 1拍 + offset):
+        offset = timestamps[0]*1000 + 1拍 - nt_level[0]
     返回 (offset_int, note_time_level_no_offset)
     """
     settings = {'bpm': float(base_bpm), 'pitch': int(pitch), 'offset': 0}
     nt = compute_note_times(angle_data, settings, actions, add_offset=False)
-    offset = round(timestamps[0] * 1000 - nt[0][0])
+    beat_ms = 60000.0 / max(1e-9, float(base_bpm) * (float(pitch) / 100.0))
+    offset = round(timestamps[0] * 1000.0 + beat_ms - nt[0][0])
     return offset, nt

@@ -1,17 +1,17 @@
 """
 apply_vfx.py — 把 VFXNet 的帧级视觉特效预测，吸附到生成谱面的方块上，
-注入为 ADOFAI 顶层 actions（与 Twirl 同格式：{"floor": <0-based tile>, "eventType": ...}）。
+注入为 ADOFAI 顶层 actions（与 Twirl 同格式：{"floor": <原生 0-based floor>, "eventType": ...}）。
 
- 设计（用户拍板，2026-08-11：完全自由发挥）
+ 设计（用户拍板，2026-08-11：完全自由发挥；2026-08-29 重申拔掉重音门）
  ------------------------------------
    - 模型对每一时刻预测 20 类特效的激活概率 ev[e,fi]。
-   - 特效吸附到「重音格」：玩法 Twirl 翻身 + 模型本帧峰值极高的强拍。
-     （仅用于把特效对齐到方块，不算数量限制。）
-   - 每个重音格注入「所有超过存在性下限 ABS_THR 的事件」—— 爱放几个放几个，
-     不做 top-K 精选、不堆满上限、不限制总数。模型自由发挥。
-   - 特效幅度随该格音乐强度(模型峰值)缩放：强拍更狠、弱拍更轻。
-   - 已开放全部视觉事件（含 MoveTrack/AnimateTrack/PositionTrack/SetFilter 等），
-     filterType 仅从受控白名单选，绝不自创。仅 MultiPlanet 不注入（结构事件）。
+   - 自由发挥：不设「重音门」，每个方块都是候选，由模型对各事件的预测概率
+     （越过 ABS_THR 存在性下限）自行决定放不放、放几个、落在哪格。
+   - 注入「所有超过存在性下限 ABS_THR 的事件」—— 爱放几个放几个，
+     不做 top-K 精选、不堆满上限、不限制总数、不卡出现位置。模型自由发挥。
+   - 特效幅度由模型直接决定（逆变换 [-1,1]→量纲 + 非负下界），不随音乐强度缩放。
+   - 已开放全部视觉事件（含 MoveTrack/AnimateTrack/SetFilter/SetFilterAdvanced 等），
+     filterType 仅从受控白名单选，绝不自创。仅 MultiPlanet(结构事件) / PositionTrack(用户禁用) 不注入。
    - aux 构造与训练端 extract_vfx 完全一致：aux[0] 只在 Twirl 重音处给包络，
      aux[1] 局部间隔、aux[2] 转角、aux[3] 歌曲位置。
 
@@ -37,9 +37,9 @@ except Exception:
         return "cuda" if torch.cuda.is_available() else "cpu"
 
 N_FILTERS = len(FILTER_TYPES)  # 与训练端 effects_schema / train_vfx 同步（当前 120 种真实滤镜名）
-# apply_vfx.py 位于 <portable>/app/training/apply_vfx.py；退 3 层到 <portable> 根
-_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CKPT = os.path.join(_ROOT, "data", "checkpoints", "vfx_net.pt")
+# VFX 权重经 paths.resolve_checkpoint 统一解析：运行时目录(网页/GUI 训练产出)优先，
+# 回退便携内置目录(出厂权重)。修复：旧版写死便携目录，网页训练出的 vfx_net.pt 永远读不到。
+CKPT_NAME = "vfx_net.pt"
 
 # 每帧绝对下限：模型对该事件把握低于此值就不注入（不塞入完全不信的特效）
 ABS_THR = 0.30
@@ -88,6 +88,12 @@ BLOOM_TH_SCALE = 0.35
 # 用户反馈 0.5 仍偏高（2026-08-14 20:07）由 0.5 降至 0.3；现再反馈"还是有点高"（2026-08-15）降至 0.15。
 BLOOM_INT_SCALE = 0.15
 
+# —— 绽放(Bloom)出谱总衰减（2026-09 用户反馈"晃得人看不到轨道了"）——
+# 阈值和强度在写进谱面前，额外再 ÷ BLOOM_OUT_DIV（两层下压叠加）。
+# 叠加后实际系数：阈值 ×0.35÷6 = 0.0583、强度 ×0.15÷6 = 0.0250。
+# 只改 threshold/intensity 两个字段，不动颜色/时长/数量/位置（守 VFX 自由发挥铁律）。
+BLOOM_OUT_DIV = 6.0
+
 
 def _bump(center, T, sigma=1.5):
     lo = max(0, int(round(center - 3.0 * sigma)))
@@ -104,36 +110,51 @@ def _clip(x, lo, hi):
     return max(lo, min(hi, xf))
 
 
-def _build_aux(level, T):
+def _build_aux(level, T, times=None):
     """构造 4 通道节奏辅助 (4,T)，与训练时 extract_vfx 的 aux 格式严格对齐。
 
     aux[0] Twirl 重音高斯包络（仅翻身处）  aux[1] 局部间隔(秒)
     aux[2] 局部转角幅度(/180)              aux[3] 歌曲相对位置(0~1)
+
+    times：外部传入的方块时间轴(ms)。apply_vfx 先做「时间轴回缩对齐」再传入，
+    保证 aux 特征落帧与注入端读取 ev 的帧轴是同一条时间轴（2026-09 运镜丢帧修复：
+    旧版 aux 用未回缩时间构造、注入却读回缩后的帧，两条帧轴错位随时间线性放大，
+    模型在方块帧上的概率峰值几乎全部被错过 -> 运镜被大面积丢弃）。
+    缺省时自行 compute_note_times，行为同旧版。
     """
     aux = np.zeros((4, T), np.float32)
     aux[3, :] = np.linspace(0.0, 1.0, T, dtype=np.float32)
     angle_data = level.get("angleData", []) or []
     actions = level.get("actions", []) or []
-    try:
-        nt = compute_note_times(angle_data, level.get("settings", {}) or {},
-                                 actions, add_offset=True)
-        times = [float(x[0]) if isinstance(x, (tuple, list)) else float(x) for x in nt]
-    except Exception:
-        return aux
+    if times is None:
+        try:
+            nt = compute_note_times(angle_data, level.get("settings", {}) or {},
+                                     actions, add_offset=True)
+            times = [float(x[0]) if isinstance(x, (tuple, list)) else float(x) for x in nt]
+        except Exception:
+            return aux
+    else:
+        times = [float(x[0]) if isinstance(x, (tuple, list)) else float(x) for x in times]
     if not times:
         return aux
     n = len(times)
     frames = [max(0, min(T - 1, int(round(t / HOP_MS)))) for t in times]
     ad = (list(angle_data) + [0] * max(0, n - len(angle_data)))[:n]
 
-    # Twirl 翻身下标（真正重音）
+    # Twirl 翻身帧（真正重音）。floor 为 0-based tile 序号: Twirl@floor F 在
+    # tile F 到达瞬间触发 = nt[F-1] = frames[F-1], 故 ti=fl-1 是【触发帧】索引
+    # (时间索引, 与 floor 0/1-based 约定无关, 数值不变)。floor 0(触发=起点帧 0)
+    # 会被 fl-1=-1 丢弃 —— 语料与生成端都无 floor 0 事件, 无实际影响。
     twirl_floors = set()
+    n_ad = len(angle_data)
     for a in actions:
         if isinstance(a, dict) and a.get("eventType") == "Twirl":
             try:
-                twirl_floors.add(int(round(float(a.get("floor")))))
+                ti = int(round(float(a.get("floor")))) - 1
             except Exception:
-                pass
+                continue
+            if 0 <= ti < n_ad:
+                twirl_floors.add(ti)
 
     # aux[0] 只在 Twirl 重音处打高斯包络
     for i, f in enumerate(frames):
@@ -160,10 +181,11 @@ def _build_aux(level, T):
     return aux
 
 
-def _make_action(name, pa_vec, intensity, mag=1.0, ease_idx=0, filt_idx=0, disable=False):
+def _make_action(name, pa_vec, intensity, mag=1.0, ease_idx=0, filt_idx=0, disable=False, seed_key=0):
     """委托 effects_schema.build_action —— 字段名按 ADOFAI-JS 官方定义，滤镜名受控、
-    缓动由模型预测索引决定。"""
-    return build_action(name, pa_vec, intensity, mag, ease_idx=ease_idx, filt_idx=filt_idx, disable=disable)
+    缓动由模型预测索引决定。seed_key（帧号）驱动未学习维度（如 MoveCamera 方向）的
+    确定性伪随机，保证同一帧每次生成结果一致。"""
+    return build_action(name, pa_vec, intensity, mag, ease_idx=ease_idx, filt_idx=filt_idx, disable=disable, seed_key=seed_key)
 
 
 def _sanitize(o):
@@ -184,7 +206,11 @@ def _sanitize(o):
 
 
 def _ftime_of(a, nt):
-    """取某动作（含 floor）对应的方块时间（秒）。nt 为 0-based tile 时间列表。"""
+    """取某动作（含 floor）对应的方块时间（秒）。
+    floor 为原生 0-based: 事件在 tile F 到达瞬间触发 = nt[F-1], fl-1 是【触发时间】
+    索引(时间索引, 与 floor 约定无关)。nt[j] = tile j+1 的到达时间（ms）。
+    2026-09 修复: 旧版漏除 1000, 返回的是毫秒, 而 _filter_flash 拿它跟
+    FLASH_GAP_SEC(秒) 比较 -> 最小间隔形同虚设(只靠数量上限兜底), 现统一回秒。"""
     try:
         fl = int(a.get("floor", 1)) - 1
     except Exception:
@@ -193,11 +219,11 @@ def _ftime_of(a, nt):
         t = nt[fl]
         if isinstance(t, (list, tuple)):
             try:
-                return float(t[0])
+                return float(t[0]) / 1000.0
             except Exception:
                 return 0.0
         try:
-            return float(t)
+            return float(t) / 1000.0
         except Exception:
             return 0.0
     return 0.0
@@ -248,6 +274,7 @@ def _lower_bloom_threshold(actions):
     与 _filter_flash 同层：注入后的后处理干预，不动 build_action 的模型自由发挥映射（守 VFX 铁律）。
     """
     changed = 0
+    _k = BLOOM_TH_SCALE / BLOOM_OUT_DIV
     for a in actions:
         if a.get("eventType") != "Bloom":
             continue
@@ -255,12 +282,12 @@ def _lower_bloom_threshold(actions):
             th = float(a.get("threshold", 0.0))
         except Exception:
             continue
-        new_th = max(0.0, th * BLOOM_TH_SCALE)
+        new_th = max(0.0, th * _k)
         a["threshold"] = round(new_th, 3)
         changed += 1
     if changed:
-        print(f"[vfx] Bloom 阈值下压：{changed} 个 Bloom 的阈值 ×{BLOOM_TH_SCALE}"
-              f"（泛光更明显，不动强度/颜色）")
+        print(f"[vfx] Bloom 阈值下压：{changed} 个 Bloom 的阈值 ×{_k:.4f}"
+              f"(={BLOOM_TH_SCALE}÷{BLOOM_OUT_DIV:g})（不动强度/颜色）")
 
 
 def _lower_bloom_intensity(actions):
@@ -271,6 +298,7 @@ def _lower_bloom_intensity(actions):
     （守 VFX 铁律）。系数 BLOOM_INT_SCALE 可调（调小=更弱）。
     """
     changed = 0
+    _k = BLOOM_INT_SCALE / BLOOM_OUT_DIV
     for a in actions:
         if a.get("eventType") != "Bloom":
             continue
@@ -278,12 +306,12 @@ def _lower_bloom_intensity(actions):
             it = float(a.get("intensity", 0.0))
         except Exception:
             continue
-        new_it = max(0.0, it * BLOOM_INT_SCALE)
+        new_it = max(0.0, it * _k)
         a["intensity"] = round(new_it, 3)
         changed += 1
     if changed:
-        print(f"[vfx] Bloom 强度下压：{changed} 个 Bloom 的 intensity ×{BLOOM_INT_SCALE}"
-              f"（泛光更柔和，不动阈值/颜色）")
+        print(f"[vfx] Bloom 强度下压：{changed} 个 Bloom 的 intensity ×{_k:.4f}"
+              f"(={BLOOM_INT_SCALE}÷{BLOOM_OUT_DIV:g})（不动阈值/颜色）")
 
 
 def apply_vfx(level, audio, vfx_ckpt=None, intensity=1.0, device=None):
@@ -291,9 +319,10 @@ def apply_vfx(level, audio, vfx_ckpt=None, intensity=1.0, device=None):
     intensity 固定 1.0（幅度不再有滑块/地板压缩，由模型自由决定）；
     mag=1.0（不再随音乐强度缩放，纯模型控制）。"""
     if vfx_ckpt is None:
-        vfx_ckpt = CKPT
-    if not os.path.exists(vfx_ckpt):
-        print(f"[vfx] 权重缺失({vfx_ckpt})，跳过特效注入")
+        from paths import resolve_checkpoint
+        vfx_ckpt = resolve_checkpoint(CKPT_NAME)
+    if vfx_ckpt is None:
+        print(f"[vfx] 权重缺失（{CKPT_NAME}，已查找运行时目录与便携内置目录），跳过特效注入")
         return level
     if device is None:
         try:
@@ -307,16 +336,11 @@ def apply_vfx(level, audio, vfx_ckpt=None, intensity=1.0, device=None):
     model.load_state_dict(sd, strict=True)
     model = model.to(device).eval()
 
-    # 2) 输入（mel 复用 demucs 分离结果；aux 由 level 反算方块时间构造，与训练一致）
+    # 2) 输入准备：mel（音频）+ nt（方块时间轴，先回缩对齐再喂 aux）。
+    #    顺序是关键：aux 必须用与注入读取 ev 完全相同的（回缩后）时间轴构造，
+    #    否则两条帧轴错位随时间线性放大，模型峰值被大面积错过（运镜丢帧根因）。
     mel = demucs_mel(audio, device=device)        # (6,128,T)
     T = mel.shape[2]
-    aux = _build_aux(level, T)                     # (4,T)
-
-    # 3) 推理
-    with torch.no_grad():
-        ev, pa, fl, ez, dis = predict_vfx(model, mel, aux, device=device)  # (V,T),(V,3,T),(F,T),(V,E,T),(T,)
-
-    # 4) 定位方块时间
     try:
         nt = compute_note_times(level.get("angleData", []), level.get("settings", {}),
                                 level.get("actions", []), add_offset=True)
@@ -326,16 +350,40 @@ def apply_vfx(level, audio, vfx_ckpt=None, intensity=1.0, device=None):
     if not nt:
         return level
 
+    # ── 时间轴对齐保护（防御「后半段复制几十次」）────────────────────
+    # 根因：BPM 自动检测偏差 或 复用半长/错长 mel 缓存，使「方块时间轴」超出
+    # 「音频 mel 时长」，后半段 fi 全部 clamp 到末帧 -> 特效在谱面后半段
+    # 一模一样复制几十次（看着就是没特效）。正常对齐的谱 _scale≈1 不触发。
+    # 处理：若方块最大时间超过 mel 时长，按全局比例线性回缩到 [0,(T-1)*HOP_MS]，
+    # 整曲仍铺满、且后半段不再复制末帧。
+    # 2026-09 运镜修复：回缩挪到 aux 构造【之前】，aux 与注入共用这条回缩后的
+    # 时间轴。旧版 aux 用未回缩时间构造、注入读回缩后的帧 -> 帧轴错位 ->
+    # 运镜等特效被大面积丢弃（98格谱仅14格过阈，实际模型想给95格）。
+    try:
+        _max_t = max(((t[0] if isinstance(t, (tuple, list)) else t) for t in nt))
+        _t_cap = (T - 1) * HOP_MS
+        if _max_t > _t_cap * 1.001:
+            _scale = _t_cap / float(_max_t)
+            nt = [((t[0] * _scale, t[1]) if isinstance(t, (tuple, list)) else t * _scale)
+                  for t in nt]
+            print(f"[vfx] 时间轴回缩×{_scale:.3f}（方块最大时间 {_max_t:.0f}ms 超 mel 时长 "
+                  f"{_t_cap:.0f}ms），避免后半段复制")
+    except Exception:
+        pass
+
+    # aux 由 level 反算方块时间构造，与训练端 extract_vfx 格式严格对齐；
+    # 传入回缩后的 nt —— 与注入读取 ev 的帧轴同轴（运镜丢帧修复的核心）。
+    aux = _build_aux(level, T, times=nt)                     # (4,T)
+
+    # 3) 推理
+    with torch.no_grad():
+        ev, pa, fl, ez, dis = predict_vfx(model, mel, aux, device=device)  # (V,T),(V,3,T),(F,T),(V,E,T),(T,)
+
     I = float(np.clip(intensity, 0.0, 1.0))
-    # 自由发挥：不限制每格注入数量，所有超过存在性下限的特效都注入。
-    twirl_floors = set()
-    for a in level.get("actions", []):
-        if a.get("eventType") == "Twirl":
-            try:
-                twirl_floors.add(int(a["floor"]))
-            except Exception:
-                pass
-    peak = ev.max(axis=0)            # (T,) 每帧峰值事件概率
+    # 自由发挥（2026-08-29 用户重申「自由发挥，除了我之前单独限制过的」）：
+    # 拔掉「重音门」——不再用 ACCENT_BAR / Twirl 位置卡住特效出现在哪格。
+    # 每个方块都是候选，由模型对各事件的预测概率(越过 ABS_THR 存在性下限)自行决定，
+    # 爱放几个放几个、落在哪格完全由模型定，不强制对齐到重音/翻身。
     angle_data = level.get("angleData", [])
     new_actions = []
     for i, tms in enumerate(nt):
@@ -344,40 +392,30 @@ def apply_vfx(level, audio, vfx_ckpt=None, intensity=1.0, device=None):
         if isinstance(tms, (tuple, list)):
             tms = tms[0]
         fi = max(0, min(T - 1, int(round(tms / HOP_MS))))
-        # 重音门：只认 Twirl 翻身 或 模型峰值极高的强拍；其余格一律不注入
-        # 注意 nt 索引 i 是 0-based（对应 floor=i+1），twirl_floors 存的是 1-based floor，故用 i+1 比较
-        is_accent = (i + 1 in twirl_floors) or (float(peak[fi]) >= ACCENT_BAR)
-        if not is_accent:
-            continue
-        tile_peak = float(peak[fi])
-        # 幅度自由发挥：mag 固定 1.0（不再随音乐强度缩放），强度 intensity 固定 1.0
         mag = 1.0
-        # 候选：ev 超过存在性下限 ABS_THR 的事件全部注入（自由发挥，不限数量）。
+        # 候选：ev 超过存在性下限 ABS_THR 的事件全部注入（自由发挥，不限数量、不限位置）。
         cands = []
         for e in range(len(VFX_EVENTS)):
             name = VFX_EVENTS[e]
             s = float(ev[e, fi])
-            # SetFilter 用更低的出现门槛，其余事件用 ABS_THR
+            # SetFilter/SetFilterAdvanced 用更低的出现门槛，其余事件用 ABS_THR
             thr = SETFILTER_THR if name in ("SetFilter", "SetFilterAdvanced") else ABS_THR
             if s < thr:
                 continue
-            # 滤镜类(SetFilter/SetFilterAdvanced)不受全局重音门限制：
-            # 只要模型本帧认为「该加滤镜」(自身概率越过 ABS_THR) 就注入，
-            # 避免某些歌曲重音稀少导致一个滤镜都出不来（用户反馈「新歌没滤镜」）。
-            # 其余事件仍须落在重音格上（与音乐节奏对齐，避免满屏乱飞）。
-            if name not in ("SetFilter", "SetFilterAdvanced") and not is_accent:
-                continue
             cands.append((s, e, name))
         for s, e, name in cands:
-            # 用户要求（2026-08-14）：解锁全部视觉特效，模型自由发挥；仅禁用 PositionTrack
-            # （位置轨道难看，且训练端已禁用不让模型学）。MultiPlanet 由 build_action 返回
-            # None 兜底不注入。
-            if name in ("PositionTrack", "SetFilterAdvanced"):
+            # 用户要求（2026-08-29）：SetFilterAdvanced 输出时去掉 "Advanced" 后缀，
+            # 统一当作 SetFilter 处理——SetFilter 在 ADOFAI 里可正常识别，
+            # Advanced 变体的额外字段（rotation/noise/transitionTime/speed）不需要。
+            if name == "SetFilterAdvanced":
+                name = "SetFilter"
+            # 用户明确要求禁用（位置轨道难看，2026-08-14）：仅 PositionTrack。
+            if name in ("PositionTrack",):
                 continue
             # 模型预测该事件该用哪种缓动 / 哪种滤镜（自由，不再写死 InOutSine/Linear）
             ez_vec = ez[e, :, fi]                       # (E,)
             ease_idx = int(np.argmax(ez_vec))
-            if name in ("SetFilter", "SetFilterAdvanced"):
+            if name in ("SetFilter",):
                 # 带温度 softmax + top-k 采样，避免 Grayscale 等高频类垄断
                 _lg = fl[:, fi] / FILT_TEMP
                 for _gi in _GRAY_IDXS:           # 压低纯灰阶，让别的滤镜出来
@@ -396,10 +434,11 @@ def apply_vfx(level, audio, vfx_ckpt=None, intensity=1.0, device=None):
                 filt_idx = 0
                 disable = False
             act = _make_action(name, pa[e, :, fi], intensity, mag,
-                               ease_idx=ease_idx, filt_idx=filt_idx, disable=disable)
+                               ease_idx=ease_idx, filt_idx=filt_idx, disable=disable,
+                               seed_key=fi)
             if act is None:
                 continue
-            act["floor"] = i + 1  # ADOFAI floor 为 1-based（nt 索引 i 对应 floor=i+1）
+            act["floor"] = i + 1  # floor 0-based: 要在 nt[i](tile i+1 到达瞬间)触发 -> floor=i+1
             new_actions.append(act)
 
     level = _sanitize(level)

@@ -30,12 +30,43 @@ BEAT_COND_CH = 3
 _f2b = None
 
 
+def _local_checkpoint():
+    """离线安全解析本地完整 Beat This 检查点(auto-BPM 卡死根因修复)。
+
+    背景: 便携包 torch_hub 缓存里曾只有 `beat_this-small0.ckpt.*.partial` 下载残件,
+    传裸名 "small0" 时 beat_this.load_checkpoint 的 torch.load 直读分支抛
+    FileNotFoundError, 随即走 torch.hub.load_state_dict_from_url 联网重下——
+    在离线/防火墙环境下请求挂死, 表现为"勾选自动检测 BPM 后生成谱面直接卡死"。
+
+    这里显式寻找已存在的完整 .ckpt(优先 portable torch_hub 缓存, 其次默认用户缓存),
+    找到就返回绝对路径 -> load_checkpoint 命中 torch.load 本地直读, 零网络;
+    都没有才回退裸名(仍可能联网, 但与原行为一致)。>1MB 体积校验防捡到残件。
+    """
+    import torch
+
+    name = f"beat_this-{CHECKPOINT}.ckpt"
+    roots = []
+    try:
+        roots.append(Path(torch.hub.get_dir()) / "checkpoints")
+    except Exception:
+        pass
+    roots.append(Path.home() / ".cache" / "torch" / "hub" / "checkpoints")
+    for root in roots:
+        cand = root / name
+        try:
+            if cand.is_file() and cand.stat().st_size > 1_000_000:
+                return str(cand)
+        except OSError:
+            continue
+    return CHECKPOINT
+
+
 def _get_a2b(device):
     """懒加载 Audio2Beats（进程内只建一次）。"""
     global _f2b
     if _f2b is None:
         from beat_this.inference import Audio2Beats
-        _f2b = Audio2Beats(checkpoint_path=CHECKPOINT, device=device, dbn=False)
+        _f2b = Audio2Beats(checkpoint_path=_local_checkpoint(), device=device, dbn=False)
     return _f2b
 
 

@@ -12,6 +12,7 @@ import os
 import sys
 import io
 import json
+import re
 import time
 import base64
 import subprocess
@@ -29,6 +30,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from onset_detector import SR, HOP_LENGTH, detect_onsets, _ffmpeg_exe
+from paths import resolve_checkpoint
 
 SERVER_REF = [None]
 # 单次上传体量上限（音频）。超过直接 413 拒绝，避免大文件整包读进内存拖崩服务。
@@ -37,10 +39,20 @@ MAX_AUDIO_BYTES = 1 * 1024 ** 3
 # 模型路线（VAE+扩散 / OnsetNet）依赖 torch，跑在 venv 里；网页后端用自带 python 跑。
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PORTABLE_ROOT = os.path.dirname(APP_DIR)
-VENV_PY = os.path.join(PORTABLE_ROOT, "venv", "Scripts", "python.exe")
+# venv 解释器路径：Windows 在 venv/Scripts/，Linux 在 venv/bin/（Docker 部署用）。
+# 若 venv 不存在（源码直跑/容器里依赖装在系统 site-packages），直接退回当前解释器。
+if sys.platform == "win32":
+    VENV_PY = os.path.join(PORTABLE_ROOT, "venv", "Scripts", "python.exe")
+else:
+    VENV_PY = os.path.join(PORTABLE_ROOT, "venv", "bin", "python")
+if not os.path.isfile(VENV_PY):
+    VENV_PY = sys.executable
 INFER_SCRIPT = os.path.join(PORTABLE_ROOT, "app", "training", "inference_stage2.py")
-TRAIN_LOG = os.path.join(PORTABLE_ROOT, "data", "train.log")
-PREVIEW_DIR = os.path.join(PORTABLE_ROOT, "data", "preview")
+# 运行时数据目录（缓存/预览/训练输出/日志）—— 装到 Program Files 后普通用户无写权限，
+# 统一重定向到 %LOCALAPPDATA%\ADOFAI_Diffusion（卸载时一并清掉）。
+RUNTIME_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ADOFAI_Diffusion")
+TRAIN_LOG = os.path.join(RUNTIME_DIR, "train.log")
+PREVIEW_DIR = os.path.join(RUNTIME_DIR, "preview")
 os.makedirs(PREVIEW_DIR, exist_ok=True)
 
 
@@ -56,8 +68,8 @@ def _fix_venv_cfg():
     被拷贝到的具体位置，搬到任意盘符/目录都能正常工作。
     """
     cfg_path = os.path.join(PORTABLE_ROOT, "venv", "pyvenv.cfg")
-    if not os.path.exists(cfg_path):
-        return
+    if sys.platform != "win32" or not os.path.exists(cfg_path):
+        return  # 仅 Windows 便携版需要修复；Linux/容器 venv 不做改写
     # 模型 venv 依赖便携版自带的标准 Python（python313），不是嵌入式 python
     # （嵌入式 python 无完整标准库、不能作为 venv base，且版本可能不匹配）。
     rel_home = "..\\..\\python313"
@@ -99,7 +111,7 @@ _fix_venv_cfg()  # 模块加载时立即修复
 TRAIN_STATE = {"proc": None, "kind": None, "started": 0.0, "status": "idle", "phase": ""}
 
 # VFX 训练独立状态机（与踩点/风格训练互不干扰，共用 TRAIN_LOG 以外的独立日志）
-VFX_LOG = os.path.join(PORTABLE_ROOT, "data", "vfx_train.log")
+VFX_LOG = os.path.join(RUNTIME_DIR, "vfx_train.log")
 VFX_STATE = {"proc": None, "kind": None, "started": 0.0, "status": "idle", "phase": ""}
 
 
@@ -139,7 +151,7 @@ def _vfx_currently_running():
     if VFX_STATE["status"] == "running":
         return True
     # 手动启动的训练：检查训练日志近期是否更新
-    for c in (os.path.join(PORTABLE_ROOT, "data", "train_vfx.log"), VFX_LOG):
+    for c in (os.path.join(RUNTIME_DIR, "train_vfx.log"), VFX_LOG):
         try:
             if os.path.exists(c) and (time.time() - os.path.getmtime(c)) < 150:
                 return True
@@ -149,24 +161,56 @@ def _vfx_currently_running():
 
 
 def _kill_train_vfx():
-    """强杀手动启动的 train_vfx.py 进程（网页状态机之外启动的）。"""
+    """强杀手动启动的 train_vfx.py 进程（网页状态机之外启动的）。
+
+    wmic 在 Windows 11 24H2+ 已被移除，改用 PowerShell CIM 按「命令行含 train_vfx」
+    精确匹配杀进程；PowerShell 不可用时回退 wmic（老系统兜底）。
+    """
     killed = False
+    if sys.platform != "win32":
+        # Linux/macOS：pkill 按命令行精确匹配（容器/源码直跑用）
+        try:
+            r = subprocess.run(["pkill", "-f", "train_vfx"],
+                               capture_output=True, timeout=15)
+            killed = (r.returncode == 0)
+        except Exception:
+            pass
+        return killed
+    # 方式1：PowerShell Get-CimInstance（Win11 / PS3.0+ 通用）
+    ps = (
+        "Get-CimInstance Win32_Process "
+        "-Filter \"Name='python.exe' OR Name='pythonw.exe'\" | "
+        "Where-Object { $_.CommandLine -match 'train_vfx' } | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+        "-ErrorAction SilentlyContinue; Write-Output $_.ProcessId }"
+    )
     try:
-        out = subprocess.run(
-            ["wmic", "process", "where", "name='python.exe'",
-             "get", "processid,commandline"],
-            capture_output=True, text=True, timeout=15).stdout
-        for line in out.splitlines():
-            if "train_vfx.py" in line:
-                pid = line.strip().split()[-1]
-                try:
-                    subprocess.run(["taskkill", "/F", "/PID", pid],
-                                    capture_output=True, timeout=10)
-                    killed = True
-                except Exception:
-                    pass
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-Command", ps],
+            capture_output=True, text=True, timeout=30)
+        if (r.stdout or "").strip():
+            killed = True
     except Exception:
         pass
+    # 方式2：老系统回退 wmic（输出仍为非空时才判定杀到）
+    if not killed:
+        try:
+            out = subprocess.run(
+                ["wmic", "process", "where", "name='python.exe'",
+                 "get", "processid,commandline"],
+                capture_output=True, text=True, timeout=15).stdout
+            for line in (out or "").splitlines():
+                if "train_vfx.py" in line:
+                    pid = line.strip().split()[-1]
+                    try:
+                        subprocess.run(["taskkill", "/F", "/PID", pid],
+                                        capture_output=True, timeout=10)
+                        killed = True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     return killed
 
 
@@ -212,6 +256,10 @@ def _training_worker(commands, kind, log_path=TRAIN_LOG, state=TRAIN_STATE):
             "OPENBLAS_NUM_THREADS": "1", "NUMEXPR_MAX_THREADS": "1",
             "HF_HUB_OFFLINE": "1",   # Demucs 权重已缓存, 离线加载跳过网络重试
             "PYTHONUNBUFFERED": "1",  # 强制子进程无缓冲, 训练日志实时落盘(避免静默假死错觉)
+            # 离线加载 Demucs/beat_this 权重：指向打包内 torch_hub。
+            # 不设的话 torch.hub 会退回 ~/.cache/torch（开发机有缓存能跑，
+            # 第三方软件首次训练/分离就断网重试卡死）。
+            "TORCH_HOME": os.path.join(PORTABLE_ROOT, "torch_hub"),
         })
         if use_cpu:
             env["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -244,36 +292,57 @@ def _training_worker(commands, kind, log_path=TRAIN_LOG, state=TRAIN_STATE):
 def _start_training(kind, data_dir, opts):
     if TRAIN_STATE["status"] == "running":
         return False, "训练正在进行中，请先停止或等待完成"
-    if not data_dir or not os.path.isdir(data_dir):
-        return False, "数据目录不存在或无效，请先选择有效的训练数据目录"
+    # —— 小白式：训练目标由下拉决定（default=默认综合 / vocal / melody），数据目录与输出权重自动对应 ——
+    target = (opts.get("train_target") or "default")
+    if target not in ("vocal", "melody", "default"):
+        target = "default"
+    single_root = os.path.join(PORTABLE_ROOT, "train_single")
+    if target == "default":
+        # 默认综合模型：melody+vocal 双目录全量喂入(2026-12 用户指令)
+        dirs = [os.path.join(single_root, t) for t in ("melody", "vocal")]
+        missing = [d for d in dirs if not os.path.isdir(d)]
+        if missing:
+            return False, ("训练数据目录不存在：" + " ; ".join(missing) +
+                           "\n请把「歌曲.ogg/mp3 + 歌曲.adofai」放进 train_single/melody 与 "
+                           "train_single/vocal（每首一个子文件夹）再训练")
+        data_dir = os.pathsep.join(dirs)
+    else:
+        data_dir = os.path.join(single_root, target)
+        if not os.path.isdir(data_dir):
+            return False, (f"训练数据目录不存在：{data_dir}\n"
+                          f"请把「歌曲.ogg/mp3 + 歌曲.adofai」放进 train_single/{target}/ 再训练")
     try:
         os.makedirs(os.path.dirname(TRAIN_LOG), exist_ok=True)
         open(TRAIN_LOG, "w").close()   # 清空旧日志
     except Exception:
         pass
-    ckpt = os.path.join(PORTABLE_ROOT, "data", "checkpoints")
+    ckpt = os.path.join(RUNTIME_DIR, "checkpoints")
     os.makedirs(ckpt, exist_ok=True)
 
-    finetune = bool(opts.get("finetune_on"))
-    ckpt_onset = os.path.join(ckpt, "onset_net.pt")
+    # 踩点模型：从该类型专属数据集「从零训练」一个新模型（不复用综合模型权重，避免被混合谱带偏）。
+    if target == "default":
+        target_ckpt = os.path.join(ckpt, "onset_net.pt")
+    else:
+        target_ckpt = os.path.join(ckpt, f"onset_net_{target}.pt")
     onset_cmd = [VENV_PY, os.path.join(PORTABLE_ROOT, "app", "training", "train_onset.py"),
                  "--train_dir", data_dir,
-                 "--epochs", str(int(opts.get("onset_epochs", 80)))]
-    if finetune:
-        # 微调模式：从已有 onset_net.pt 继续训，保留其他歌能力；输出独立文件不覆盖原权重
-        onset_cmd += ["--resume", ckpt_onset,
-                      "--out", os.path.join(ckpt, "onset_net_finetune.pt")]
-    else:
-        onset_cmd += ["--out", ckpt_onset]
+                 "--epochs", str(int(opts.get("onset_epochs") or 80)),
+                 "--out", target_ckpt]
     diff_env = {"ADOFAI_TRAIN_DIR": data_dir,
-                "ADOFAI_DATA_DIR": os.path.join(PORTABLE_ROOT, "data")}
+                "ADOFAI_DATA_DIR": RUNTIME_DIR}
     if opts.get("vae_epochs"):
-        diff_env["VAE_EPOCHS"] = str(int(opts["vae_epochs"]))
+        try:
+            diff_env["VAE_EPOCHS"] = str(int(opts["vae_epochs"]))
+        except (TypeError, ValueError):
+            pass
     if opts.get("ddpm_epochs"):
-        diff_env["DDPM_EPOCHS"] = str(int(opts["ddpm_epochs"]))
+        try:
+            diff_env["DDPM_EPOCHS"] = str(int(opts["ddpm_epochs"]))
+        except (TypeError, ValueError):
+            pass
     diff_cmd = [VENV_PY, os.path.join(PORTABLE_ROOT, "app", "training", "train_stage2.py")]
 
-    onset_expect = [os.path.join(ckpt, "onset_net_finetune.pt" if finetune else "onset_net.pt")]
+    onset_expect = [target_ckpt]
     diff_expect = [os.path.join(ckpt, "vae.pt"), os.path.join(ckpt, "ddpm.pt")]
 
     commands = []
@@ -305,9 +374,9 @@ def _start_vfx_training(data_dir, epochs, rebuild_cache):
         open(VFX_LOG, "w").close()   # 清空旧日志
     except Exception:
         pass
-    ckpt = os.path.join(PORTABLE_ROOT, "data", "checkpoints")
+    ckpt = os.path.join(RUNTIME_DIR, "checkpoints")
     os.makedirs(ckpt, exist_ok=True)
-    cache_dir = os.path.join(PORTABLE_ROOT, "data", "vfx_cache")
+    cache_dir = os.path.join(RUNTIME_DIR, "vfx_cache")
     os.makedirs(cache_dir, exist_ok=True)
     extract_path = os.path.join(PORTABLE_ROOT, "app", "training", "extract_vfx.py")
     train_vfx_path = os.path.join(PORTABLE_ROOT, "app", "training", "train_vfx.py")
@@ -366,6 +435,8 @@ def generate_chart_model(audio_bytes, filename, params):
     difficulty = int(params.get("difficulty", 1))
     track = params.get("track", "all") or "all"
     vfx = bool(params.get("vfx", False))
+    # 同音多采拦截(判据F连发簇合并+落谱<2帧合并)：默认开；前端取消勾选 -> 保留全部近距踩点。
+    dual_block = bool(params.get("dual_block", True))
     try:
         intensity = float(params.get("intensity", 0.5))
     except (TypeError, ValueError):
@@ -410,12 +481,14 @@ def generate_chart_model(audio_bytes, filename, params):
 
     # ---- 根据所选音轨决定喂给 AI 的音频与 track ----
     selected = params.get("selected") or []
+    onset_mode = params.get("onset_mode", "auto") or "auto"
     try:
         infer_wav, track = _resolve_infer_input(tmpdir, wav_path, selected, adofai_path)
     except Exception as e:
         return {"ok": False, "error": f"音轨处理失败：{e}"}
     return run_inference(infer_wav, track, difficulty, base_bpm, adofai_path, filename,
-                          vfx=vfx, intensity=intensity, auto_bpm=auto_bpm)
+                          vfx=vfx, intensity=intensity, auto_bpm=auto_bpm,
+                          onset_mode=onset_mode, dual_block=dual_block)
 
 
 def _venv_env():
@@ -428,6 +501,8 @@ def _venv_env():
         "HF_HUB_OFFLINE": "1",
         # 离线加载 Demucs 预训练模型：指向打包内的 torch_hub 缓存
         "TORCH_HOME": os.path.join(PORTABLE_ROOT, "torch_hub"),
+        # 显式指定数据目录，确保推理子进程加载权重路径与 web_server 检查路径一致
+        "ADOFAI_DATA_DIR": RUNTIME_DIR,
     })
     # 把便携根目录（ffmpeg.exe 所在）前置到 PATH，确保 venv 内 librosa/audioread
     # 离线也能找到内置 ffmpeg，无需系统安装（群友「did not find executable」根因）。
@@ -536,7 +611,8 @@ def _resolve_infer_input(tmpdir, wav_path, selected, adofai_path):
 
 
 def run_inference(wav_path, track, difficulty, base_bpm, adofai_path, filename,
-                  vfx=False, intensity=0.5, auto_bpm=False):
+                  vfx=False, intensity=0.5, auto_bpm=False, onset_mode="auto",
+                  dual_block=True):
     """给定已解码 wav 与 track，跑 OnsetNet+VAE/扩散 -> .adofai（可选注入 VFX）。
 
     auto_bpm=False 时严格使用用户填写的 base_bpm（不被 Beat This 估计值覆盖）；
@@ -555,11 +631,24 @@ def run_inference(wav_path, track, difficulty, base_bpm, adofai_path, filename,
         except Exception:
             _dur = 0.0
         _steps = 25 if _dur > 360 else (35 if _dur > 180 else 50)
+        # —— 踩点模式：auto/vocal/melody 映射到对应 onset 权重；文件缺失则回退标准权重 ——
+        _onset_ckpt = None
+        if onset_mode == "vocal":
+            _onset_ckpt = "onset_net_vocal.pt"
+        elif onset_mode == "melody":
+            _onset_ckpt = "onset_net_melody.pt"
+        if _onset_ckpt and resolve_checkpoint(_onset_ckpt) is None:
+            print(f"[infer] 踩点模式={onset_mode} 的权重 {_onset_ckpt} 不存在，回退标准 onset_net.pt")
+            _onset_ckpt = None
         cmd = [VENV_PY, INFER_SCRIPT, "--audio", wav_path, "--out", adofai_path,
                "--bpm", str(base_bpm), "--steps", str(_steps), "--guidance", "2.5",
                "--track", str(track)]
+        if _onset_ckpt:
+            cmd += ["--onset_ckpt", _onset_ckpt]
         if auto_bpm:
             cmd += ["--auto_bpm"]
+        if not dual_block:
+            cmd += ["--no_dual_block"]
         if vfx:
             cmd += ["--vfx", "--intensity", str(intensity)]
         proc = subprocess.run(
@@ -580,17 +669,35 @@ def run_inference(wav_path, track, difficulty, base_bpm, adofai_path, filename,
         return {"ok": False, "error": f"读取/解析谱面失败：{e}"}
     try:
         level["settings"]["difficulty"] = max(1, min(10, difficulty))
+        # 用户要求（2026-08-30）：生成的谱面默认带轨道淡入淡出动画，
+        # 下落方块在到达前 4 拍淡入（trackAnimation）、离开后 2 拍淡出（trackDisappearAnimation）。
+        _s = level.setdefault("settings", {})
+        _s["trackAnimation"] = "Fade"
+        _s["beatsAhead"] = 4
+        _s["trackDisappearAnimation"] = "Fade"
+        _s["beatsBehind"] = 2
         # 根因修复：推理内部把音频解码成固定名 input.wav，但用户下载后真实音频是原始上传文件名。
         # 必须把 settings.song / songName 写回原始歌名，否则游戏在关卡文件夹里找不到音频 -> 直接加载失败。
         _song_name = os.path.basename(filename)
         if _song_name:
             level.setdefault("settings", {})["song"] = os.path.splitext(_song_name)[0]
             level.setdefault("settings", {})["songName"] = os.path.splitext(_song_name)[0]
+            # 用户要求（2026-08-29）：settings 写入 songFilename（含扩展名）。
+            # 把 .adofai 复制到音频所在目录后，游戏凭此文件名直接定位音频。
+            level.setdefault("settings", {})["songFilename"] = _song_name
         adofai_text = json.dumps(level, ensure_ascii=False, indent=1)
         # 写回磁盘（前端可能直接读该文件而非返回文本）
         try:
             with open(adofai_path, "w", encoding="utf-8-sig") as f:
                 f.write(adofai_text)
+            # 存 metadata sidecar（供历史记录"打开所在文件夹"用）
+            import json as _json, time as _time
+            _meta_path = adofai_path + ".meta.json"
+            try:
+                with open(_meta_path, "w", encoding="utf-8") as _mf:
+                    _json.dump({"source_path": filename, "generated_at": _time.time()}, _mf, ensure_ascii=False)
+            except Exception:
+                pass
         except Exception:
             pass
     except Exception:
@@ -733,16 +840,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _train_log_payload(self):
         n = int(self.headers.get("X-Lines", "300"))
+        # 日志来源统一化：网页启动的训练写 TRAIN_LOG(train.log)；
+        # 命令行手动启动的训练按模型分文件（train_melody.log 等），
+        # 一律扫描 RUNTIME_DIR 下所有 train*.log（排除 vfx/shape，它们有独立页签/接口），
+        # 近 2 分钟有更新的视为 RUNNING，让网页训练页能看到真实滚动进度。
         lines = []
-        if os.path.exists(TRAIN_LOG):
-            with open(TRAIN_LOG, encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+        any_running = TRAIN_STATE["status"] == "running"
+        now = time.time()
+        candidates = [("train.log", TRAIN_LOG)]
+        try:
+            for fn in sorted(os.listdir(RUNTIME_DIR)):
+                low = fn.lower()
+                if (low.startswith("train") and low.endswith(".log")
+                        and low != "train.log"
+                        and "vfx" not in low and "shape" not in low):
+                    candidates.append((fn, os.path.join(RUNTIME_DIR, fn)))
+        except Exception:
+            pass
+        per = max(40, n // max(1, len(candidates)))
+        for tag, lp in candidates:
+            if not os.path.exists(lp):
+                continue
+            try:
+                recent = (now - os.path.getmtime(lp)) < 120
+            except Exception:
+                recent = False
+            if recent:
+                any_running = True
+            try:
+                with open(lp, encoding="utf-8", errors="replace") as f:
+                    content = f.readlines()
+            except Exception:
+                content = []
+            tail = content[-per:]
+            if tail:
+                lines.append("===== [%s] %s =====" % (tag, "RUNNING" if recent else "STOPPED"))
+                lines.extend(tail)
         return json.dumps({
             "log": "".join(lines[-n:]),
-            "status": TRAIN_STATE["status"],
-            "phase": TRAIN_STATE["phase"],
-            "running": TRAIN_STATE["status"] == "running",
-            "kind": TRAIN_STATE["kind"],
+            "status": "running" if any_running else ("idle" if not lines else "done"),
+            "phase": TRAIN_STATE.get("phase", ""),
+            "running": any_running,
+            "kind": TRAIN_STATE.get("kind") or "onset/diffusion",
         })
 
     def _vfx_log_payload(self):
@@ -763,7 +902,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """ShapeModel 走线模型训练实时状态：读 data/shape_train.log + GPU + 预处理进度。"""
         import subprocess, glob, time
         n = int(self.headers.get("X-Lines", "500"))
-        log_path = os.path.join(PORTABLE_ROOT, "data", "shape_train.log")
+        log_path = os.path.join(RUNTIME_DIR, "shape_train.log")
         lines = []
         if os.path.exists(log_path):
             with open(log_path, encoding="utf-8", errors="replace") as f:
@@ -784,9 +923,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 gpu_mem = int(parts[1].replace("MiB", "").strip()) if len(parts) > 1 else None
         except Exception:
             pass
-        # 预处理进度：特征缓存 npz 数
-        feat_dir = os.path.join(PORTABLE_ROOT, "data", "shape_feat_cache")
+        # 预处理进度：优先从日志末尾的 "[feat] i/total" 行解析真实进度；无日志时退化为 npz 数
+        feat_dir = os.path.join(RUNTIME_DIR, "shape_feat_cache")
         feat_done = len(glob.glob(os.path.join(feat_dir, "*.npz"))) if os.path.isdir(feat_dir) else 0
+        feat_total = 0
+        for l in reversed(lines):
+            m = re.search(r"\[feat\]\s+(\d+)/(\d+)", l)
+            if m:
+                feat_done = int(m.group(1))
+                feat_total = int(m.group(2))
+                break
         # 进程是否活跃（三重检测：进程名 > GPU 高占用 > 日志 mtime）
         running = False
         try:
@@ -807,12 +953,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 running = (time.time() - os.path.getmtime(log_path)) < 120
         except Exception:
             pass
-        ckpt = os.path.join(PORTABLE_ROOT, "data", "checkpoints", "shape_model.pt")
-        done = os.path.exists(ckpt)
+        done = resolve_checkpoint("shape_model.pt") is not None
         return json.dumps({
             "log": log_text, "skip": skip, "ok": ok,
             "gpu_util": gpu_util, "gpu_mem": gpu_mem,
-            "feat_done": feat_done, "feat_total": 105,
+            "feat_done": feat_done, "feat_total": feat_total,
             "running": running, "done": done,
         })
 
@@ -826,7 +971,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """
         import re
         candidates = [
-            os.path.join(PORTABLE_ROOT, "data", "train_vfx.log"),
+            os.path.join(RUNTIME_DIR, "train_vfx.log"),
             VFX_LOG,
         ]
         best = None
@@ -895,27 +1040,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
         })
 
     def _model_status_payload(self):
-        """探测 checkpoints/ 下四个权重文件是否存在且非空，返回结构化状态。
+        """探测各权重文件是否就绪，返回结构化状态。
 
-        用于前端真实展示每个模型是否就绪，替换原先写死的「没有模型」提示语。
+        用统一解析器 resolve_checkpoint：优先运行时目录(用户训练)，回退便携内置目录(出厂)。
+        present=True 时额外给出 source（已训练=运行时目录 / 内置=随包发布），前端可展示来源。
+        all_ready = 核心三件套(踩点/VAE/扩散)是否就绪，即可否直接生成；vfx/shape/分轨为可选增强。
         """
-        ckpt = os.path.join(PORTABLE_ROOT, "data", "checkpoints")
+        _portable_ck = os.path.normcase(os.path.join(PORTABLE_ROOT, "data", "checkpoints"))
         models = [
-            ("onset_net.pt", "踩点模型 OnsetNet"),
-            ("vae.pt", "风格模型 VAE"),
-            ("ddpm.pt", "扩散模型 DDPM"),
-            ("vfx_net.pt", "视觉特效 VFXNet"),
+            ("onset_net.pt", "踩点模型 OnsetNet", True),
+            ("onset_net_melody.pt", "踩点模型 OnsetNet·旋律", False),
+            ("onset_net_vocal.pt", "踩点模型 OnsetNet·人声", False),
+            ("vae.pt", "风格模型 VAE", True),
+            ("ddpm.pt", "扩散模型 DDPM", True),
+            ("vfx_net.pt", "视觉特效 VFXNet", False),
+            ("shape_model.pt", "摆形状 ShapeModel", False),
         ]
         out = []
-        for fname, label in models:
-            p = os.path.join(ckpt, fname)
-            try:
-                ok = os.path.exists(p) and os.path.getsize(p) >= 1024
-                sz = round(os.path.getsize(p) / 1048576, 2) if ok else 0
-            except Exception:
-                ok, sz = False, 0
-            out.append({"file": fname, "label": label, "present": ok, "size_mb": sz})
-        return json.dumps({"models": out, "all_ready": all(m["present"] for m in out)})
+        for fname, label, core in models:
+            p = resolve_checkpoint(fname)
+            if p is not None:
+                try:
+                    sz = round(p.stat().st_size / 1048576, 2)
+                except OSError:
+                    sz = 0.0
+                np = os.path.normcase(str(p))
+                source = "内置" if (np.startswith(_portable_ck + os.sep) or np == _portable_ck) else "已训练"
+                out.append({"file": fname, "label": label, "present": True,
+                            "size_mb": sz, "source": source, "core": core})
+            else:
+                out.append({"file": fname, "label": label, "present": False,
+                            "size_mb": 0, "source": "", "core": core})
+        all_ready = all(m["present"] for m in out if m["core"])
+        return json.dumps({"models": out, "all_ready": all_ready})
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
@@ -1047,7 +1204,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 body = json.loads(raw.decode("utf-8")) if raw else {}
                 kind = body.get("kind", "all")
                 data_dir = body.get("data_dir", "")
-                opts = {k: body.get(k) for k in ("onset_epochs", "vae_epochs", "ddpm_epochs", "finetune_on")}
+                opts = {k: body.get(k) for k in ("onset_epochs", "vae_epochs", "ddpm_epochs", "train_target")}
                 ok, msg = _start_training(kind, data_dir, opts)
                 self._send(200, json.dumps({"ok": ok, "msg": msg}))
             except Exception as e:
@@ -1130,14 +1287,17 @@ def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=0, help="固定端口(默认随机空闲端口)")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="监听地址(默认仅本机)。容器/局域网共享用 0.0.0.0")
     ap.add_argument("--no-browser", action="store_true", help="不起浏览器(仅服务)")
     args = ap.parse_args()
 
-    srv = Server(("127.0.0.1", args.port or 0), Handler)
+    srv = Server((args.host, args.port or 0), Handler)
     SERVER_REF[0] = srv
     port = srv.server_address[1]
-    url = f"http://127.0.0.1:{port}/"
-    print(f"ADOFAI Diffusion 已启动: {url}")
+    shown = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
+    url = f"http://{shown}:{port}/"
+    print(f"ADOFAI Diffusion 已启动: {url}  (listen={args.host}:{port})")
     if not args.no_browser:
         threading.Thread(target=open_browser, args=(url, url + "api/health"),
                          daemon=True).start()

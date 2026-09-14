@@ -8,7 +8,7 @@
 切成定长 CHUNK 帧 (需被 16 整除), 步长 stride 做数据增广。
 """
 from __future__ import annotations
-import glob, json
+import os, glob, json
 import numpy as np
 import torch
 import torch.utils.data as td
@@ -30,12 +30,32 @@ def _mel(y):
 
 
 def _pairs(train_dir):
+    # 支持【多目录】(list, 或 os.pathsep 分隔的字符串) —— 默认综合模型喂
+    # melody+vocal 双目录全量(2026-12 用户指令); 单目录行为不变。
+    if isinstance(train_dir, (list, tuple)):
+        dirs = [str(d) for d in train_dir]
+    else:
+        dirs = [d for d in str(train_dir).split(os.pathsep) if d]
     pairs = []
-    for d in glob.glob(train_dir + "/*/"):
-        og = sorted(glob.glob(d + "*.ogg") + glob.glob(d + "*.mp3"))
-        ad = sorted(glob.glob(d + "*.adofai"))
-        if og and ad:
-            pairs.append((og[0], ad[0]))
+    for train_dir_ in dirs:
+        if not os.path.isdir(train_dir_):
+            print(f"[dataset] 跳过不存在的目录: {train_dir_}")
+            continue
+        for name in sorted(os.listdir(train_dir_)):
+            d = os.path.join(train_dir_, name)
+            if not os.path.isdir(d):
+                continue
+            auds = [f for f in os.listdir(d)
+                    if f.lower().endswith(('.ogg', '.mp3', '.wav'))]
+            ads = [f for f in os.listdir(d) if f.lower().endswith('.adofai')]
+            if not auds or not ads:
+                continue
+            # 优先级 ogg > mp3 > wav（与原 ogg/mp3 优先行为一致，且方括号安全）
+            def _pri(f):
+                return {'ogg': 0, 'mp3': 1, 'wav': 2}.get(f.lower().rsplit('.', 1)[-1], 3)
+            auds.sort(key=_pri)
+            pairs.append((os.path.join(d, auds[0]), os.path.join(d, sorted(ads)[0])))
+    print(f"[dataset] 配对 {len(pairs)} 首 (来自 {len(dirs)} 个目录)")
     return pairs
 
 
@@ -46,12 +66,12 @@ class DenseChartDataset(td.Dataset):
         self.items = []          # (mel_path_or_y, dense, bpm) 预存稠密+音频懒加载
         self.samples = []        # (pair_idx, start)
         for pi, (ogg, adf) in enumerate(_pairs(train_dir)):
-            lvl = load_adofai(adf)
-            if not isinstance(lvl, dict):
-                continue
-            bpm = float((lvl.get("settings") or {}).get("bpm", 120.0) or 120.0)
-            # 预先算 mel 与 dense 并缓存到内存(105~250 首, 可控)
             try:
+                lvl = load_adofai(adf)
+                if not isinstance(lvl, dict):
+                    continue
+                bpm = float((lvl.get("settings") or {}).get("bpm", 120.0) or 120.0)
+                # 预先算 mel 与 dense 并缓存到内存(105~250 首, 可控)
                 y, _ = librosa.load(ogg, sr=SR, mono=True)
                 mel = _mel(y)
                 T = mel.shape[1]
@@ -65,7 +85,9 @@ class DenseChartDataset(td.Dataset):
                 for s in range(0, max(1, T - chunk) + 1, stride):
                     if s + chunk <= T:
                         self.samples.append((len(self.items) - 1, s))
-            except Exception:
+            except Exception as e:
+                # 多目录全量训练: 单首解码/解析失败只跳过该首, 不让整集报废
+                print(f"[dataset] 跳过失败样本: {os.path.basename(ogg)} ({e})")
                 continue
 
     def __len__(self):

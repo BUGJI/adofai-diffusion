@@ -1,10 +1,11 @@
 """
 validate_beat_align.py — 干净的"踩点"校验（修正 off-by-one）
 
-正确语义（来自 timing_engine.compute_note_times）：
-  nt[i][0] = 关卡时间下，到达 tile (i+1) 的累计时间。
-  tile 0（出生点）在关卡时间 0，对应歌曲时间 = settings['offset']。
-  故：tile k 的歌曲时间 = offset + (nt[k-1][0] 当 k>=1) ，tile 0 = offset。
+正确语义（来自 timing_engine.compute_note_times，真相公式）：
+  歌曲时间 = 关卡时间 - 1拍 + offset（音乐在关卡时间「1拍-offset」处开播）。
+  nt[i][0] = 歌曲时间下，到达 tile (i+1) 的累计时间。
+  tile 0（出生点）在关卡时间 0，对应歌曲时间 = offset - 1拍。
+  故：tile k 的歌曲时间 = (offset - 1拍) + (nt[k-1][0] 当 k>=1)，tile 0 = offset - 1拍。
   第 k 个 onset 帧 = onset_frames[k]。
   => 正确比对：tile k 的歌曲时间 应 ≈ onset_frames[k] * HOP_MS。
 
@@ -25,6 +26,7 @@ sys.path.insert(0, str(ROOT / "training"))
 from onset_detector import detect_onsets
 from chart_repr import HOP_MS
 from timing_engine import compute_note_times
+from adofai_parse import load_adofai
 
 
 def main():
@@ -34,25 +36,30 @@ def main():
     audio = sys.argv[1]
     chart = sys.argv[2]
 
-    level = json.load(open(chart, encoding="utf-8"))
+    level = load_adofai(chart)   # 宽容解析(语料常见 BOM/尾逗号/缺字段), 严格 json 会挂
+    if not isinstance(level, dict):
+        print(f"[error] 无法解析谱面: {chart}")
+        return
     ad = level["angleData"]
     settings = level["settings"]
     actions = level.get("actions", [])
     offset = int(settings.get("offset", 0))
     bpm = float(settings.get("bpm", 120))
 
-    # 复现推理期的 onset 检测（与大佬方案推理期完全一致）
+    # 复现推理期的 onset 检测（与两阶段流水线推理期完全一致）
     det_times, _, _ = detect_onsets(audio, wait=4, avg_win=24, k=1.0)
     T_full = int(round(det_times[-1] * 1000.0 / HOP_MS)) + 64 if det_times else 0
     onset_frames = sorted({int(round(t * 1000.0 / HOP_MS)) for t in det_times})
     print(f"[info] bpm={bpm} offset={offset} tiles={len(ad)} "
           f"detector_onsets={len(onset_frames)}")
 
-    # 真实引擎逐格到达时间（含 offset）
+    # 真实引擎逐格到达时间（含 offset；真相公式: 歌曲时间 = 关卡时间 - 1拍 + offset）
     nt = compute_note_times(ad, settings, actions, add_offset=True)
-    # nt[i][0] = 到 tile (i+1) 的歌曲时间；tile 0 在歌曲时间 = offset。
+    # nt[i][0] = 到 tile (i+1) 的歌曲时间；tile 0 在歌曲时间 = offset - 1拍
+    # (音乐在关卡时间 1拍-offset 开播, 行星出生比音乐早 1拍-offset —— v2 点击测试实证)。
     # 构造 tile_k_songtime[k] = tile k 的歌曲时间
-    tile_songtime = [offset] + [nt[i][0] for i in range(len(ad))]
+    tile_songtime = [offset - 60000.0 / max(1e-9, bpm * float(settings.get("pitch", 100)) / 100.0)] \
+        + [nt[i][0] for i in range(len(ad))]
 
     # ---- A) 正确比对：tile k <-> onset k ----
     errs_correct = []

@@ -5,7 +5,7 @@ extract_vfx.py — VFXNet 训练数据提取（重写版：自由 / 无限制）
 设计哲学（与旧版的根本区别）
 ----------------------------
 旧版：多标签每帧"能激活的视觉事件都激活" -> 模型学会"见块就放一堆" ->
-      推理时铺满、杂乱、像一坨垃圾。这不是参数问题，是标签与辅助通道设计错了。
+      推理时铺满、杂乱、不可用。这不是参数问题，是标签与辅助通道设计错了。
 
 新版三条铁律：
   1) 标签自由：不再做每帧稀疏截断，所有激活事件都进标签（MAX_EVENTS_PER_FRAME=None）。
@@ -26,8 +26,8 @@ extract_vfx.py — VFXNet 训练数据提取（重写版：自由 / 无限制）
         aux[2] 局部转角幅度(/180)            aux[3] 歌曲相对位置(0~1)
 
 用法：
-  python extract_vfx.py --data D:/ADOFAI_AI_Mug/vision/best --out data/vfx_cache
-  （只产出目标/辅助缓存 + 统计；梅尔在训练 Dataset 里现算）
+  python extract_vfx.py --data "<视觉数据根: 每子文件夹一首 .adofai+音频>" --out data/vfx_cache
+  （缺省即项目根相对路径; 只产出目标/辅助缓存 + 统计；梅尔在训练 Dataset 里现算）
 """
 from __future__ import annotations
 import os, sys, json, argparse, glob
@@ -138,6 +138,7 @@ def build_frame_targets(level, T, filter_index):
     aux    (4, T)  float32  方块节奏辅助通道
     """
     ad = _to_angle_data(level) or []
+    n_tiles = len(ad)            # 原生 angleData 格数(内部 0-based tile 上界 = n_tiles-1)
     settings = level.get("settings") or {}
     if not isinstance(settings, dict):
         settings = {}
@@ -166,14 +167,19 @@ def build_frame_targets(level, T, filter_index):
 
     tile_frames = [max(0, min(T - 1, int(round(t / HOP_MS)))) for t in times]
 
-    # 收集 Twirl 翻身所在的下标（真正的重音）
+    # 收集 Twirl 翻身所在的帧（真正的重音）。
+    # floor 为 0-based tile 序号: Twirl@floor F 在 tile F 到达瞬间触发
+    # = tile_frames[F-1], 故 ti=fl-1 是【触发帧】索引(时间索引, 与 floor
+    # 0/1-based 约定无关, 数值不变)。floor 0 会被 fl-1=-1 丢弃(语料无此事件)。
     twirl_floors = set()
     for a in actions:
         if isinstance(a, dict) and a.get("eventType") == "Twirl":
             try:
-                twirl_floors.add(int(round(float(a.get("floor")))))
+                ti = int(round(float(a.get("floor")))) - 1
             except Exception:
-                pass
+                continue
+            if 0 <= ti < n_tiles:
+                twirl_floors.add(ti)
 
     # 辅助通道：
     #   aux[0] 只在 Twirl 重音处给高斯包络（普通 tile 不给 -> 模型不会见块就放）
@@ -216,10 +222,10 @@ def build_frame_targets(level, T, filter_index):
         if fl is None:
             continue
         try:
-            fi = int(round(float(fl)))
+            fi = int(round(float(fl))) - 1   # 触发时间索引: floor F -> tile F 到达帧 tile_frames[F-1]
         except Exception:
             continue
-        if not (0 <= fi < len(times)):
+        if not (0 <= fi < n_tiles):          # floor 0(触发=起点)与越界值丢弃(语料无 floor 0 事件)
             continue
         tf = tile_frames[fi]
         ei = EVENT_INDEX[et]
@@ -270,10 +276,10 @@ def _pick_chart(folder):
 
 
 def _audio_of(folder):
-    for ext in ("*.ogg", "*.mp3", "*.wav"):
-        fs = sorted(glob.glob(os.path.join(folder, ext)))
-        if fs:
-            return fs[0]
+    fs = [f for f in os.listdir(folder)
+          if f.lower().endswith(('.ogg', '.mp3', '.wav'))]
+    if fs:
+        return os.path.join(folder, sorted(fs)[0])
     return None
 
 
@@ -382,8 +388,10 @@ def build(best_dir, out_dir, limit=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default=r"D:/ADOFAI_AI_Mug/vision/best")
-    ap.add_argument("--out", default=r"D:/ADOFAI_AI_Mug/new_last_128/portable/data/vfx_cache")
+    ap.add_argument("--data", default=str(ROOT / "train_vfx"),
+                    help="视觉训练数据根(每子文件夹一首: .adofai+音频); 缺省 项目根/train_vfx")
+    ap.add_argument("--out", default=str(ROOT / "data" / "vfx_cache"),
+                    help="事件目标缓存输出; 缺省 项目根/data/vfx_cache")
     ap.add_argument("--limit", type=int, default=0, help="仅处理前 N 个（调试用）")
     a = ap.parse_args()
     build(a.data, a.out, limit=a.limit or None)

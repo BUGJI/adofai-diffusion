@@ -1,13 +1,13 @@
 """
 chart_repr.py — ADOFAI 谱面 <-> 稠密张量 (C, T) 双向转换
 ========================================================
-按大佬架构(两阶段流水线):
+采用两阶段流水线架构:
   - 角度由【转换器】按 "间隔×180/拍长" 确定性算出,模型不碰角度 →
     彻底绕开「绝对角度回归塌缩」+「276s 物理错位」两个坑。
   - 方向(左/右):左/右转在同一时刻音频完全相同,模型学不到方向信号,故由
     plan_directions【几何路径规划】指派(不自交 + 留屏内),模型预测仅作平局破冰。
-    这正对应大佬"转换器把时间点转成角度"的做法——方向是确定性布局决策。
-  - SetSpeed 不做(大佬未做);Twirl 已启用:由 plan_path_twirl 计时反推式植入
+    这正对应"转换器把时间点转成角度"的做法——方向是确定性布局决策。
+  - SetSpeed 不做;Twirl 已启用:由 plan_path_twirl 计时反推式植入
     (不破坏踩点;Twirl 仅做视觉镜像翻转),由 onset 重音 + 模型 C2 弱偏置驱动。
 
   通道布局 (C=3):
@@ -59,7 +59,13 @@ def _bump(center, T, sigma=ONSET_SIGMA):
 
 
 def _events_by_floor(actions):
-    """返回 twirl_floors:set。"""
+    """返回 twirl:set —— Twirl 所在的内部 0-based tile 下标。
+
+    原生 .adofai 的 Twirl floor 本身就是 0-based tile 序号(见 timing_engine
+    事件循环注释的 ADOFAI-JS / AutoCat 源码证据): floor F = 离开 tile F 的弧,
+    故直接 ti = fl(floor<0 的非法值丢弃)。消费方(adofai_to_dense 的
+    `if i in twirl`)按 0-based tile/弧下标比较, i 即弧下标 = tile 下标。
+    """
     twirl = set()
     for a in (actions or []):
         if not isinstance(a, dict):
@@ -67,7 +73,12 @@ def _events_by_floor(actions):
         et = a.get("eventType")
         fl = a.get("floor")
         if et == "Twirl" and fl is not None:
-            twirl.add(int(fl))
+            try:
+                ti = int(round(float(fl)))
+            except (TypeError, ValueError):
+                continue
+            if ti >= 0:
+                twirl.add(ti)
     return twirl
 
 
@@ -88,7 +99,7 @@ def adofai_to_dense(level, T, hop_ms=HOP_MS, global_bpm=120.0):
     if not nt:
         return np.zeros((N_CH, T), np.float32)
     times = [float(x[0]) if isinstance(x, (tuple, list)) else float(x) for x in nt]
-    twirl = _events_by_floor(actions)
+    twirl = _events_by_floor(actions)   # 0-based tile/弧下标(原生 floor 即 0-based)
     dense = np.zeros((N_CH, T), np.float32)
     n = len(ad)
     for i in range(n):
@@ -138,160 +149,270 @@ def _shortest(a):
     return a - 360.0 if a > 180.0 else a
 
 
+def _cumulative_snap(angles, grid=15.0):
+    """累积传导式吸附(2026-08-23 定稿方案)。
+
+    与"每格独立吸到最近 grid 倍数"不同: 每吸附一格, 修正量会传导给后续
+    所有格(后续有效角 -= 修正量), 使整条轨迹绝对朝向保持连续, 仅抹平
+    局部抖动, 不产生累积漂移。
+
+    参数:
+        angles: 已 round 到 1° 的整数角度列表
+        grid:   目标吸附步进(默认 15°, 即 ADOFAI 合法角度步进)
+    返回:
+        吸附后的整数角度列表(仍落在 grid 倍数上)
+    """
+    out = []
+    drift = 0.0
+    for a in angles:
+        eff = a + drift                 # 当前格有效角(含历史漂移)
+        t = round(eff / grid) * grid    # 吸附到最近 grid 倍数
+        delta = t - eff                 # 本格修正量
+        drift += delta                  # 传导: 后续格全部偏移 -delta
+        # 吸附结果落在 grid 倍数, 再 round 到 1° 保证整数
+        out.append(int(round(t)))
+    return out
+
+
+def _cumulative_round_diff(angles):
+    """角度取整: 累积和取整再差分(主修 2026-11-14, 长谱漂移根因)。
+
+    逐角度独立 round 会让 ±0.5°/格的量化误差沿上千块砖随机游走 ——
+    实测一张 1484 块、bpm=200 的长谱累计 ~30ms 相位漂移, 呈"越走越快、
+    后半谱面比音乐提前一格"。改为对累积角度取整再差分:
+      cum_k = Σ_{i<=k} a_i (浮点),  out_k = round(cum_k) - round(cum_{k-1})
+    任意前缀的整数累积和都是浮点累积和的最优整数近似, 累积误差被压在
+    ±0.5°(单砖时间差 ≤ 半个 HOP_MS), 任何后段位置的到达时间不再漂。
+    """
+    acc = 0.0
+    prev = 0
+    out = []
+    for a in angles:
+        acc += float(a)
+        c = int(round(acc))
+        out.append(c - prev)
+        prev = c
+    return out
+
+
+
 def plan_path_twirl(magnitudes, twirl_desire=None, model_twirl=None, turn_sign=None, step=1.0):
-    """计时反推式路径规划(含可选 Twirl)——这是大佬"第二个模型加事件"的可微替代。
+    """踩点驱动反推式路径规划(含 Twirl 镜像)——重写于 2026-08-22。
 
-    核心: ADOFAI 计时引擎里 Twirl 会翻转 direction, 而引擎按 p_angle=(dest_{i-1}-180-dest_i)*dir
-    算每格时长(不取最短弧)。由此反推得【计时精确】的闭式递推:
-        dest_i = (dest_{i-1} - 180 - m_i * d_i)  mod 360
-    其中 m_i = 该格目标转角幅度(由节拍锁死: 间隔×bpm×3), d_i = Twirl 奇偶(+1/-1)。
-    代入验证: p_angle_i = (dest_{i-1}-180-dest_i)*d_i = m_i*d_i^2 = m_i -> 每格时长恒等于目标,
-    无论是否 Twirl, 踩点误差=0。视觉上 Twirl 仅把该格转向翻成镜像(原路径在屏内则镜像也在屏内)。
+    核心机制(对照 SharpFAI LevelUtils.cs + 真实谱面数据验证):
+      ADOFAI 计时引擎: 每格 pAngle = (curAngle - destAngle) * direction (mod 360, 不取最短弧),
+      该格时长 = pAngle/180 * 拍长。Twirl 是「全局 direction 永久开关」——遇到 Twirl 后,
+      后续所有格的 direction 乘 -1, 即把整条后续轨道镜像到另一侧走。
 
-    逐格二选一(不 Twirl / Twirl), 评分:
-      - 硬约束: 新线段与已有线段相交 -> 一票否决(不自交)
-      - 软目标: 离屏幕中心越近越好(不出屏)
-      - Twirl 偏好: twirl_desire[i] 高(音乐重音)时减分, 诱导在此翻身; 扎堆时惩罚
-      - 模型 C2 微弱偏置(可选, 通道偏弱, 仅点缀)
-    返回 (angleData, twirl_floors)  angleData=list[int], twirl_floors=1-based 格下标 list。
+      本项目 OnsetNet 已给出每个 tile 的【真实时值(拍数)】= magnitudes[i]。由此反推:
+        pAngle_i = magnitudes[i] * 180          (正值=往左转, 负值=往右转)
+        dest_i   = curAngle - pAngle_i * direction   (mod 360, 绝对角)
+      代入引擎公式验证: pAngle_real = (curAngle - dest_i)*direction = pAngle_i -> 每格时长
+      恒等于 OnsetNet 给出的真实时值(**踩点零误差, 不依赖任何近似**)。
+
+      Twirl 决策(不再白送、不再每格糊翻):
+        Twirl 翻转 direction -> 后续所有格的「往左/往右」整体镜像。这一步才轮到
+        模型/音乐决定: 当 turn_sign 想让轨道换边、或 twirl_desire(重音)/model_twirl(DDPM C2)
+        强烈驱动时, 才在此处翻身。基础成本 TW_BASE 保证「无驱动纯换边」不划算。
+
+      渲染重放(与 SharpFAI CreateFloors 一致): 每格球朝 angleData[i] 绝对方向走 step。
+      方向序列 direction 由累积 Twirl 决定, 全局生效。
+
+    参数:
+      magnitudes   : list[float], 每格真实时值(拍数, 可任意 0.25/0.5/0.75/1.0/1.5...)
+      twirl_desire : 可选, 每格 Twirl 重音驱动(来自 dense[2]/onset 重音), >=0
+      model_twirl  : 可选, 每格 DDPM C2 通道 Twirl 概率(强驱动)
+      turn_sign    : 可选, 每格模型走线方向偏置(<0=往右, >=0=往左); 提供即「模型接管」
+      step         : 渲染步长(像素/单位), 仅影响几何铺开尺度, 不影响计时
+    返回 (angleData, twirl_floors):
+      angleData      : list[float], 每格绝对行星角(0~360, 任意 15° 步进)
+      twirl_floors   : list[int], 0-based tile 下标(翻转处); tile0 永不 Twirl
     """
     import math
+    # —— 评分权重 ——
+    # 模型接管(有 turn_sign): 放开几何硬约束, 让模型主导「往左/往右」; Twirl 由驱动决定。
+    shape_mode = turn_sign is not None
+    if shape_mode:
+        INTER_PENALTY = 0.0      # 允许自交(真实谱面本就交叉)
+        OVER_W = 0.0             # 出屏惩罚移除(球可敞开铺满)
+        # 模型方向偏置: 偏置每格往左/往右选择(接管走向)。2026-08-23 提升 4->10:
+        # 之前权重过低, 被 twirl_desire(18)/model_twirl(12) 完全压制, 模型方向偏好几乎
+        # 不影响几何 -> 走线和贪心(默认往左)几乎一致、聚成一团。提到 10 后模型左右偏置
+        # 在非翻转格真正生效, 走出与贪心不同的形状。仍低于翻转驱动, 不抢 Twirl 决策。
+        SHAPE_W = 10.0
+        # 铺开激励(2026-09): 奖励让轨迹远离当前所在位置的候选(径向增益), 抑制
+        # 「形状缩成一团」。step=4 下一格外向格最多 +SPREAD_W*4≈8 分, 与 SHAPE_W 同量级、
+        # 低于重音驱动(18/12), 只在左右候选间挑更铺开的那个, 不抢 Twirl/重音决策。
+        SPREAD_W = 2.0
+        # Twirl 解耦: 翻转 direction 有基础成本, 只在重音/模型强驱动时才划算。
+        TW_BASE = 8.0            # 翻转全局方向的基础成本(不再任何情况白送)
+        TW_GAP_PENALTY = 30.0    # 最小间隔: 连续两格都翻 -> 严惩
+        TW_DESIRE_W = 18.0       # 重音驱动(必须 > TW_BASE: 有重音才划算翻)
+        TW_MODEL_W = 12.0        # DDPM C2 通道强驱动(同样 > TW_BASE)
+        step = 4.0               # 铺开尺度(像素)
+    else:
+        INTER_PENALTY = 1e9      # 几何贪心: 自交一票否决
+        OVER_W = 0.0
+        SHAPE_W = 0.0
+        TW_BASE = 8.0
+        TW_GAP_PENALTY = 30.0
+        TW_DESIRE_W = 18.0
+        TW_MODEL_W = 12.0
+        step = 3.0
+
+    # —— 预计算每格转角幅度(恒正)与「直线格」标记 ——
+    # 直线格: p_angle_base 为 180 的奇数倍(=1拍/3拍...)。此时 Twirl 翻转 direction 后
+    # 该格 dest 数学重合(0 与 360 等价), 翻转对【当前格】几何无效; 其价值仅在【未来拐点格】
+    # 显现。故直线格上的翻转不能靠当前格加分, 必须靠前瞻未来拐点驱动才划算(见前瞻逻辑)。
+    pa_list = [abs(float(m)) * 180.0 for m in magnitudes]
+    straight_list = [abs((pa % 360.0) - 180.0) < 0.5 for pa in pa_list]
+
+    # —— 前瞻窗口: 翻转 direction 后, 未来 LOOK 格整体更贴合驱动/模型时才划算 ——
+    LOOK = 6                      # 前瞻格数
+    LOOK_W = 0.15                 # 前瞻驱动累计权重(相对当格, 低折扣防噪声累积狂翻)
+    FLIP_MIN_CUR = 0.10           # 翻转当格自身必须有驱动(重音/C2)下限, 禁纯靠前瞻翻当前格
+
     pos = (0.0, 0.0)
-    heading = 90.0  # 朝上(与 ADOFAI 视觉一致)
-    dest_prev = 0.0  # 上一格线段绝对方向
-    d = 1.0         # Twirl 奇偶(+1=无翻转累积方向)
+    cur_angle = 0.0             # 上一格 destAngle (引擎 curAngle)
+    direction = 1.0             # 全局 direction(由累积 Twirl 决定)
     segs = []
     angleData = []
     twirls = []
     last_tw = -10
-    last_turn_dir = 0.0   # 上一次实际视觉拐向(+1=左/-1=右), 0=无(直行或未开始)
-    # R_TARGET：出屏惩罚阈值(球到原点距离超过则扣分)。原 25 把球死锁在中心小圈(实测
-    # 生成 RMS≈14, 而真实谱面 RMS 中位数≈57) -> 用户反馈"全聚到正中间"。放大到 90
-    # 让球能大幅铺开(匹配真实谱面尺度, 但仍锚定中心不会飞太远)。
-    R_TARGET = 90.0
-    # —— 模型接管模式：放开几何约束，让 ShapeModel 主导走向（用户要求"敞开了走"） ——
-    # 无模型(几何贪心)时维持原硬约束(自交否决/出屏惩罚/Twirl 间隔)，行为不变；
-    # 有模型时：自交降级为弱惩罚(不否决)、出屏完全放开、Twirl 间隔放开、模型方向强主导。
-    shape_mode = turn_sign is not None
-    if shape_mode:
-        # 修正(2026-08-15): 之前 SHAPE_W=100 + 零惩罚 -> 每格都按模型左右翻向,
-        # Twirl 飙到 ~47 次/120格, 球不断掉头折返 => 糊成一团。现在改为:
-        # 几何主导(不自交/不出屏), 模型只在「该拐」时温和偏置左右, 并强制 Twirl 间隔,
-        # 让球平时直行、到转角才拐 -> 真实 ADOFAI 那种"一朝着一个方向延伸"的走法。
-        INTER_PENALTY = 0.0    # 允许自交(真实谱面本就交叉; 不否决则球不必绕中心折返)
-        OVER_W = 0.0           # 出屏惩罚已按用户要求移除(球可敞开铺满屏幕, 不被 R_TARGET 锁中心)
-        SHAPE_W = 4.0          # 模型方向温和偏置(不再每格强翻)
-        ALTERNATE_BONUS = 6.0   # (2026-08-17) 轻度调疏: 从10降到6, 削弱「每格强制左右交替」
-        SAME_PENALTY = 6.0      # 同向惩罚同步降低 -> 允许偶尔同向续拐/直行(同向不翻奇偶=不twirl),
-                                 # twirl 少约三成, zigzag 招牌仍在(不再每格都翻身)
-        TW_GAP_PENALTY = 0.0    # zigzag 本就相邻翻转 -> 关掉间隔惩罚(否则抵消交替奖励)
-        # 直线格 twirl 抑制(与贪心同逻辑): mag≈180 的直线格翻转奇偶视觉仍走直线, 无意义 -> 抑制。
-        # 仅抑制直线格, 转向格的 zigzag 不受影响(招牌风格保留)。
-        STRAIGHT_TW_PENALTY = 8.0
-        STRAIGHT_THR = 30.0
-        # 持续向前延伸/防自旋 = 奖励「异方向」(连续反向拐弯), 即下方 ALTERNATE_BONUS 的语义。
-        # 注: 当前候选循环里 vt 只取决于入向 parity(两候选相同), 故 ALTERNATE_BONUS 与旧的
-        # FWD_W 都形同虚设 -> 实际走线由 ShapeModel(desired, SHAPE_W)主导。要让「异方向」真正
-        # 生效, 必须改用出向 parity d2(两候选不同)做奖励, 见下方循环内的 ALT_W。
-        ALT_W = 4.0            # 「异方向」真实奖励(>0 开启): 与 SHAPE_W 同量级 -> 温和抬升 zigzag 密度, 不抢模型主导
-        step = 2.6             # 铺开尺度放大
-    else:
-        INTER_PENALTY = 1e9    # 几何贪心: 自交一票否决
-        OVER_W = 1.0           # 几何贪心: 出屏惩罚
-        SHAPE_W = 0.0
-        TW_GAP_PENALTY = 50.0
-        # 直线格 twirl 抑制: 该 tile 几乎不转向(|vt|<阈值)时, twirl 只是翻转奇偶,
-        # 视觉上仍走直线(毫无意义)却把后续转向方向弄反 -> 纯添乱。仅几何贪心模式启用
-        # (形状模式靠真实拐弯产生 zigzag, 不受影响, 故放在 else 分支)。
-        STRAIGHT_TW_PENALTY = 8.0
-        STRAIGHT_THR = 30.0
     for i, mag in enumerate(magnitudes):
         mag = float(mag)
-        # 摆形状模型: turn_sign[i]<0 -> 期望往右(d2=-1); >=0 -> 往左(d2=+1)。
-        # 为 None 时退化为纯几何贪心(当前回滚版行为, 不影响已认可的 Twirl)。
-        desired = None
+        # —— 转角幅度恒为正(0~360) ——
+        # ADOFAI 引擎 pAngle = Fmod((cur_angle-dest)*direction, 360) 不做最短弧归一,
+        # 故 pAngle 必须恒为正(=|mag*180|)。「往左/往右」不由 pAngle 符号决定, 而由
+        # 累积 direction(=Twirl  flips)决定 —— 这正是模型 turn_sign 要控制的: 想往另一边
+        # 拐, 就在合适处放 Twirl 翻转 direction。
+        p_angle_base = pa_list[i]
+        # 模型方向偏置(2026-09 修正语义): turn_sign[i] 是「本格几何转向」(左/右),
+        # 而非「是否翻转」。要真正右转需 dir_cand=-1, dir_cand = direction*(flip?-1:1)
+        #   => 想 右 转: flip = (direction > 0)
+        #   => 想 左 转: flip = (direction < 0)
+        #   合并: desired_flip = (turn_sign[i] < 0) == (direction > 0)
+        # 旧版直接用 desired_flip = turn_sign[i] < 0, 只在 direction=+1 时碰巧正确;
+        # 一旦发生过 Twirl(direction=-1), 模型说「右」代码却奖励翻转到 dir_cand=+1(左),
+        # 偏好整体反转 -> 学到的形状被打成噪声 -> 左右均衡随机游走 -> 轨迹缩成一团。
+        # 这就是「ShapeModel 画出来的形状缩在一起」的主根因。
+        desired_flip = False
         if turn_sign is not None and i < len(turn_sign):
-            desired = -1.0 if float(turn_sign[i]) < 0 else 1.0
+            desired_flip = (float(turn_sign[i]) < 0.0) == (direction > 0.0)
+        # 径向增益基准(铺开激励用): 当前点到原点距离(候选评估期间 pos 不变)
+        dist_cur = math.hypot(pos[0], pos[1])
+        # —— Twirl 候选: 翻或不翻 direction ——
+        # 不翻: 用当前 direction; 翻: direction 取反(后续全局镜像)。
+        # 两候选的 dest 不同(因为 direction 不同 -> pAngle 镜像), 几何真正不同,
+        # 模型/驱动才能在其中做选择。pAngle 恒正 -> 两候选计时都精确(零误差)。
         best = None
-        # tile 0(出生格) 旋转方向固定为初始方向(+1)：ADOFAI 里 tile0 是起点，
-        # 没有"到达之前可翻转"的 Twirl，其 direction 恒为初始 +1。强制 d2=+1
-        # 既符合物理(出生格不能 Twirl，也满足用户规则"floor0 禁止 Twirl")，
-        # 又避免「tile0 本想翻转却无法表达 -> 整条方向链从起点就差一符号 -> 全反」。
-        if i == 0:
-            d2_candidates = (1.0,)
-        else:
-            d2_candidates = (1.0, -1.0)   # 其余格子两种绝对方向都允许
-        for d2 in d2_candidates:                  # 两种绝对方向(模型接管形状, 不再锁死同向)
-            tw = (d2 != d)                        # 该方向与当前 parity 相反 -> 记一次 Twirl(视觉镜像翻转)
-            # 关键修正(2026-08-16)：当前格的到达角度用「到达方向 d」(Twirl 只镜像「离开」那段,
-            # 到达位置不变), 翻转推迟到下一格(dest_{i+1} 才用 d2)。否则 dest_i 用翻转后的 d2
-            # 会与真实 ADOFAI(用到达方向算当前格)差半格 -> Twirl 整条方向链错位。
-            dest_i = _fmod(dest_prev - 180.0 - mag * d, 360.0)
-            vt = _shortest(dest_i - dest_prev)          # 视觉转向(用于几何)
-            nh = heading + vt
-            nx = pos[0] + step * math.cos(math.radians(nh))
-            ny = pos[1] + step * math.sin(math.radians(nh))
+        # tile0 是出生格, 不允许放 Twirl -> 翻转候选赢了也无法兑现(direction 不翻、
+        # 引擎也看不到事件), 却会让 dest 按 dir_cand=-1 反推 -> 首格 p_angle=360-p_base,
+        # 计时凭空差一倍。故 i=0 只评估不翻候选(2026-09 修复)。
+        for flip in ((False, True) if i > 0 else (False,)):
+            dir_cand = direction * (-1.0 if flip else 1.0)
+            # 引擎入向基准: curAngle = Fmod(curAngle - 180, 360) (每格先掉头180)
+            cur_in = _fmod(cur_angle - 180.0, 360.0)
+            # 反推绝对角: dest = cur_in - pAngle * dir_cand (mod 360)
+            # 代入引擎验证: pAngle_real = Fmod((cur_in - dest)*dir_cand,360) = pAngle_base
+            # (因 dir_cand^2=1) -> 每格时长 = pAngle_base/180*拍长 = |mag|*拍长 = 踩点零误差。
+            dest_i = _fmod(cur_in - p_angle_base * dir_cand, 360.0)
+            # 渲染重放(绝对角): 球朝 dest_i 方向走 step
+            nx = pos[0] + step * math.cos(math.radians(dest_i))
+            ny = pos[1] + step * math.sin(math.radians(dest_i))
             new_seg = (pos, (nx, ny))
+            # 自交检查(跳过紧邻前一条共用顶点)
             inter = False
-            for s in segs[:-1]:                          # 跳过紧邻前一条(共用顶点)
+            for s in segs[:-1]:
                 if _seg_intersect(s[0], s[1], new_seg[0], new_seg[1]):
                     inter = True
                     break
             dist = math.hypot(nx, ny)
-            over = max(0.0, dist - R_TARGET)
-            # Twirl 偏好(音乐重音 + 模型 C2 弱偏置, 仅作点缀)
+            over = max(0.0, dist - 120.0)
+            # Twirl 偏好(重音 + 模型 C2 驱动) —— 当格。
+            # 关键修复(2026-09): td/mt 奖励只应记在【翻转候选】上 —— 重音想要的
+            # 是"此处翻身", 不是"此处随便走哪边"。旧版把 -td*TW_DESIRE_W 记在
+            # 翻/不翻两个候选上, 逐格比较时恒相消 -> 当格重音对翻转决策零贡献
+            # (只剩约束 C 的放行门槛), Twirl 只能靠前瞻窗口累积或模型走向分歧才
+            # 翻得动, 系统性晚于重音格 —— 正是"twirl 晚一格"这条实测反馈的推手之一。
+            # 现仅翻转候选享受重音/C2 奖励, 兑现文档
+            # "TW_DESIRE_W 必须 > TW_BASE: 有重音才划算翻"的设计意图。
             td = 0.0
             if twirl_desire is not None and i < len(twirl_desire):
                 td = float(twirl_desire[i])
-            score = (INTER_PENALTY if inter else 0.0) + over * OVER_W - td * 6.0
-            # 持续向前延伸/防自旋(用户要「异方向」): 用出向 parity=d2(两候选不同)奖励「下一格转角
-            # 与上一实际转角异向」-> 真正能影响 Twirl 决策; ALT_W=0 时关闭(默认, 走线交给 ShapeModel)。
-            if shape_mode and ALT_W > 0.0 and last_turn_dir != 0.0:
-                next_sign = 1.0 if _shortest(-180.0 - mag * d2) >= 0.0 else -1.0
-                score += (-ALT_W if next_sign == -last_turn_dir else ALT_W)
-            if tw:
-                score += (0.0 if shape_mode else 2.0)    # 模型接管时去掉基础 Twirl 成本, 翻身更自由
-                if (i - last_tw) < 4:                    # 模型接管时放开间隔
-                    score += TW_GAP_PENALTY
-            # 直线格抑制: 该 tile 几乎不转向(|vt|<STRAIGHT_THR)时, twirl 仅翻转奇偶,
-            # 视觉仍走直线(无意义)却弄反后续转向 -> 抑制。贪心与形状模式通用。
-            if tw and abs(vt) < STRAIGHT_THR:
-                score += STRAIGHT_TW_PENALTY
-            if model_twirl is not None and i < len(model_twirl) and tw:
-                score -= float(model_twirl[i]) * 1.0     # 模型 C2 微弱偏置
-            # 学习形状偏置: 模型期望方向 -> 强主导(模型接管时几何约束已大幅放松)
-            if desired is not None and (d2 > 0) == (desired > 0):
+            mt = 0.0
+            if model_twirl is not None and i < len(model_twirl):
+                mt = float(model_twirl[i])
+            score = (INTER_PENALTY if inter else 0.0) + over * OVER_W
+            if flip:
+                score -= td * TW_DESIRE_W
+                score -= mt * TW_MODEL_W
+            # 铺开激励(shape 模式): 径向增益为正减分(奖励外向), 为负加分(抑制回缩)。
+            if shape_mode:
+                score -= SPREAD_W * (dist - dist_cur)
+            # 模型方向偏好: 本候选 flip 与模型期望的翻转一致 -> 减分(模型主导走向)
+            if shape_mode and desired_flip == flip:
                 score -= SHAPE_W
-            # 连续反向拐弯奖励(用户要求「左右左右左右」zigzag): 实际视觉拐向 vt_dir
-            # 与前一次拐向相反 -> 奖励; 同向(继续螺旋) -> 惩罚。权重(10)>SHAPE_W(4)
-            # 故稳定交替, 模型只在交替的二选一里做微弱左右偏好。
-            if shape_mode and vt != 0.0:
-                vt_dir = 1.0 if vt > 0.0 else -1.0
-                if last_turn_dir != 0.0:
-                    if vt_dir == -last_turn_dir:
-                        score -= ALTERNATE_BONUS
-                    else:
-                        score += SAME_PENALTY
+            if flip:
+                score += TW_BASE
+                # 最小间隔: 连续两格都翻 -> 严惩。但 shape 模式下【方向追踪式】翻转
+                # (模型 sign 与当前 direction 不符, 翻转是为兑现模型走向) 是几何必需:
+                # 交替符号(锯齿)本就需要每格一 Twirl(真实谱面锯齿段正是如此),
+                # 间隔惩罚只应管【重音/噪声驱动的标点式】翻转 (2026-09 修正)。
+                if (i - last_tw) < 2 and not (shape_mode and desired_flip == flip):
+                    score += TW_GAP_PENALTY
+                # —— 前瞻: 翻转后未来 LOOK 格若也强烈驱动/模型想翻, 整段受益(累计减分) ——
+                # 关键修复(2026-08-23): 直线格(p=180)翻转后当前格 dest 重合, 单格无收益;
+                # Twirl 的真正价值在后续拐点格(0.5/0.75拍)才显现。故翻转是否划算,
+                # 须看未来窗口内驱动/模型是否同样指向翻转。前瞻累计收益压过 TW_BASE 才翻。
+                look_bonus = 0.0
+                for k in range(1, LOOK + 1):
+                    j = i + k
+                    if j >= len(magnitudes):
+                        break
+                    ltd = 0.0
+                    if twirl_desire is not None and j < len(twirl_desire):
+                        ltd = float(twirl_desire[j])
+                    lmt = 0.0
+                    if model_twirl is not None and j < len(model_twirl):
+                        lmt = float(model_twirl[j])
+                    # 未来格若也在强驱动区 -> 翻转后整段贴合, 累计减分
+                    look_bonus -= (ltd * TW_DESIRE_W + lmt * TW_MODEL_W) * LOOK_W
+                    # 模型模式: 本候选翻转后 direction=-direction, 未来 j 若无再翻则
+                    # dir_cand_j=-direction; 其「想右转」被满足 <=> (sign_j<0)==(direction>0)
+                    # (与当格 desired_flip 同式, 2026-09 修正: 旧版用 ==flip 在
+                    #  direction=-1 时同样整体反转, 已随主 bug 一并修正)
+                    if shape_mode and turn_sign is not None and j < len(turn_sign):
+                        if (float(turn_sign[j]) < 0.0) == (direction > 0.0):
+                            look_bonus -= SHAPE_W * LOOK_W
+                score += look_bonus
+                has_future_kink = any(not straight_list[j]
+                                      for j in range(i + 1, min(len(magnitudes), i + 1 + LOOK)))
+                # 约束(B): 【直线格】上翻转后当前格 dest 重合、几何无即时变化, 未来 LOOK 格
+                # 内必须至少有一个「非直线拐点」, 否则翻转纯亏 -> 重罚禁止。
+                # (2026-09 修正: 当格自身是拐点时, 翻转立刻改变本格走向(左<->右),
+                #  有即时几何价值, 不受本约束 —— 旧版一刀切误伤拐点格翻转。)
+                if straight_list[i] and not has_future_kink:
+                    score += 1e9
+                # 约束(C): 翻转当格自身要有驱动(重音/C2); shape 模式下「模型方向分歧」
+                # 本身就是合法驱动(模型接管的题中之义), 豁免之 —— 否则非重音格永远
+                # 翻不了 direction, 全图被迫单向拐(全左回环), 也是聚团根因之一
+                # (2026-09 修正: 旧版一刀切禁翻, 模型在无重音处完全失声)。
+                if (td + mt) < FLIP_MIN_CUR and not (shape_mode and desired_flip == flip):
+                    score += 1e9
             if best is None or score < best[0]:
-                best = (score, tw, d2, dest_i, vt, nh, (nx, ny), new_seg)
-        _, tw, d2, dest_i, vt, nh, new_pos, new_seg = best
-        angleData.append(int(round(_shortest(dest_i))))
-        # 更新连续反向拐弯状态(直行 vt=0 不打断「最近拐向」记忆)
-        if shape_mode and vt != 0.0:
-            last_turn_dir = 1.0 if vt > 0.0 else -1.0
-        if tw:
-            # tile 0 不会进入这里：上面已强制 i==0 的 d2=+1，tw=(d2!=d)=False。
-            # （之前用"锁首格跳过 Twirl 事件"的 hack 反而让 tile0 想翻转却表达不出、
-            # 导致整条方向链从起点差一符号 —— 现改为"约束 tile0 方向=初始"从根上解决。）
+                best = (score, flip, dest_i, (nx, ny), new_seg)
+        _, flip, dest_i, new_pos, new_seg = best
+        # angleData 存最短弧表示(-180~180), 引擎内部会再 mod; 用 _shortest 保证数值稳定,
+        # 避免负角被 _fmod 映射成 >180 的大角导致后续 cur_in 累积偏差。
+        angleData.append(_shortest(dest_i))
+        if flip and i > 0:                  # tile0 永不 Twirl(出生格)
+            direction *= -1.0
             twirls.append(i)
             last_tw = i
         pos = new_pos
-        heading = nh
-        dest_prev = dest_i
-        # 关键：Twirl 翻转旋转方向，引擎第二遍会「累计」翻转后续所有 tile 的方向。
-        # 规划器必须把 d 翻成 d2，否则后续 tile 的 dest 用错奇偶 -> 踩点漂移。
-        d = d2
         segs.append(new_seg)
+        cur_angle = dest_i
     return angleData, twirls
 
 
@@ -316,8 +437,11 @@ def plan_freeform_path(n, turn_sign, turn_base=12.0, target_times=None,
 
     返回 (angleData, twirls, setspeeds)
       angleData  : 连续绝对方向(0~360) list[float]，引擎会 mod360，无妨
-      twirls     : 计时用 Twirl 的 floor 列表（符号变化处）
-      setspeeds  : 每格 SetSpeed 事件列表（校准时间到 onset 间隔）
+      twirls     : 计时用 Twirl 的 0-based tile 索引列表（符号变化处；发射时需 +1）
+      setspeeds  : 每格 SetSpeed 事件列表（校准时间到 onset 间隔；floor 已按原生 1-based 写）
+
+    ⚠️ 已停用：硬性约束「生成的谱子杜绝 SetSpeed」——生成一律走 plan_path_twirl，
+    本函数仅作存档参考，勿在推理链路调用。
     """
     angleData = []
     twirls = []
@@ -351,7 +475,7 @@ def plan_freeform_path(n, turn_sign, turn_base=12.0, target_times=None,
             p_angle = 180.0 - abs(turn)
             bpm_eff = p_angle / 180.0 * 60000.0 / Ti
             setspeeds.append({
-                "floor": int(i), "eventType": "SetSpeed",
+                "floor": int(i) + 1, "eventType": "SetSpeed",   # 原生 1-based floor
                 "speedType": "Bpm", "beatsPerMinute": float(bpm_eff / pitch),
             })
     return angleData, twirls, setspeeds
@@ -430,16 +554,43 @@ def _grid_snap_keep(kept, hop_ms, step_sec=None, max_fill_units=8):
     return res
 
 
+def _fill_missing_beats(kept, hop_ms, beat_sec, max_gap_beats=1.5):
+    """保守漏拍填充: 保留原始 onset 间隔(精确踩点), 只在明显漏检处(间隔>max_gap_beats 拍)
+    补整拍。不吸附、不拆细分(0.5/0.75 拍间隔不会触发填充, 保持原样)。"""
+    if len(kept) < 2 or beat_sec <= 1e-4:
+        return kept
+    hms = hop_ms / 1000.0
+    max_gap_frames = max_gap_beats * beat_sec / hms
+    out = [kept[0]]
+    for k in range(1, len(kept)):
+        gap = kept[k] - kept[k - 1]
+        if gap > max_gap_frames:
+            # 在中间补整拍(不超过 gap 本身)
+            n_fill = int(gap / (beat_sec / hms)) - 1
+            for j in range(1, n_fill + 1):
+                fp = kept[k - 1] + j * int(round(beat_sec / hms))
+                if fp < kept[k] and (not out or fp - out[-1] >= 2):
+                    out.append(fp)
+        if kept[k] - out[-1] >= 2:
+            out.append(kept[k])
+        else:
+            out[-1] = kept[k]   # 极近重复, 替换
+    return out
+
+
 def dense_to_adofai(dense, global_bpm=120.0, hop_ms=HOP_MS, song="generated.mp3",
                     onset_frames=None, twirl_desire=None,
                     turn_sign=None, shape_model=None, onset_prob=None,
-                    stem_energy=None, device=None):
+                    stem_energy=None, device=None, merge_dup=True):
     """(3, T) -> level dict（含 angleData/settings）。无法构成有效谱面返回 None。
 
     onset_frames: 可选。若提供（频谱 onset 检测器给出的帧下标），直接用作谱面格
-        起点（绕过 VAE 后验塌缩把稀疏 onset 抹平的问题）。角度由转换器按
-        「间隔×180/拍长」算出(确定、不塌缩、不错位);方向(左/右)由 plan_directions
-        几何规划指派(左/右转音频相同, 模型学不到, 故用路径规划保证不自交、留屏内)。
+        起点（绕过 VAE 后验塌缩把稀疏 onset 抹平的问题）。每格【真实时值(拍数)】由
+        onset 间隔算出, 传给 plan_path_twirl 反推绝对角(踩点零误差); 方向(左/右)与
+        Twirl 由模型/音乐驱动(见 plan_path_twirl 文档)。
+
+    计时不变式(2026-10): tile k+1 恰好踩在第 k 个 onset 上 —— 首个 onset 由 tile 1
+        踩中(count-in 起手旋转), 前奏由 offset 等待吸收, 末格踩最后一个 onset。
     """
     if dense is None or dense.ndim != 2 or dense.shape[0] < 2:
         return None
@@ -463,9 +614,12 @@ def dense_to_adofai(dense, global_bpm=120.0, hop_ms=HOP_MS, song="generated.mp3"
             if onset[f] >= pv and onset[f] > nv and onset[f] > thr:
                 frames.append(f)
     # 合并距离<2帧的重复 onset，保留合法短格（如 90°@120bpm≈5 帧）。
+    # merge_dup=False（同音多采拦截关）: 只去同帧精确重复——0 拍 tile 引擎无法表达,
+    # 属格式硬约束不是拦截; 1 帧(5.8ms)以上的近距重复原样保留, 供试听。
     kept = []
+    _min_gap = 2 if merge_dup else 1
     for f in frames:
-        if kept and (f - kept[-1]) < 2:
+        if kept and (f - kept[-1]) < _min_gap:
             continue
         kept.append(f)
     if len(kept) < 2:
@@ -476,13 +630,43 @@ def dense_to_adofai(dense, global_bpm=120.0, hop_ms=HOP_MS, song="generated.mp3"
     med_sec = 60.0 / float(global_bpm) if global_bpm and global_bpm > 0 else float(hop_ms / 1000.0)
     if med_sec <= 1e-4:
         med_sec = float(hop_ms / 1000.0)
-    # —— 节拍网格吸附 + 漏拍填充（修复"漏拍/跳拍/周期性错位"）——
-    # 检测到的音头含抖动/系统性延迟/中段偶发漏检：纯按音头间隔定角度会让微小偏差逐格
-    # 累积成相位漂移，漏检则整段错拍。改为吸附到 BPM 真拍网格并补齐空缺，使每格时长为
-    # 真拍整数倍 -> 完全锁定音乐节拍，不再漂移、不再漏拍。
-    kept = _grid_snap_keep(kept, hop_ms, step_sec=med_sec)
+    # —— 保守漏拍填充（不吸附、不拆细分）——
+    # 旧版 _grid_snap_keep 把 onset 吸附到整拍/半拍网格 -> 0.75 拍被压成 1 拍、0.5 拍被
+    # 拆错 -> 踩点错位 700ms+。现改为: 保留原始 onset 间隔(精确匹配踩点), 仅在「间隔 >
+    # 1.5 拍」的明显漏检处补整拍(半拍粒度不会触发, 不破坏 0.5/0.75 切分)。
+    kept = _fill_missing_beats(kept, hop_ms, beat_sec=med_sec)
     if len(kept) < 2:
         return None
+
+    # —— 计时结构(2026-10 重构): 首拍必须被踩中 ——
+    # 目标不变式: 引擎 nt[k] = offset + (m_0+...+m_k)*beat_ms ≡ kept[k]*hop_ms,
+    # 即 tile k+1 恰好踩在第 k 个 onset 上:
+    #   m_0 = count-in 起手旋转: 关卡时钟起点(歌曲时间 offset)到首个 onset 的拍数
+    #        (经典 1 拍起手; 首个 onset 本身不足 1 拍时用其全部时长, 保证 offset>=0);
+    #   m_k = kept[k]-kept[k-1] (k>=1): 引向第 k 个 onset 的弧。
+    # 由此第一个 onset 由 tile 1 踩中、最后一个 onset 由末格踩中(不再有尾部幻影拍)。
+    # (2026-08-13 的"用实际 onset 间隔算转角"原则不变: 每格时长仍=真实间隔, 踩点零误差;
+    #  长间隔已由 _fill_missing_beats 预先补整拍, 单格恒 <2 拍=360°, 引擎可精确表达。)
+    # (2026-12 还原: 15° 量化层已按要求移除 —— 每格时长恢复为【原始 onset 间隔
+    #  的精确拍数】, 不再吸附到 1/12 拍倍数; 谱面角度恢复 1° 整数自由(见输出侧
+    #  grid=1.0)。引擎单弧上限 360°(2 拍)的封顶保留: count-in 起手弧超过 2 拍的
+    #  部分引擎 Fmod 会静默砍整圈, 多余等待并入 raw_offset(出生点后移, 原生合法),
+    #  首 tap 时刻不受影响。)
+    beat_ms = med_sec * 1000.0
+    first_ms = kept[0] * hop_ms
+    # m_0 = 起手拍数: 整拍 count-in(经典 1 拍起手); 首 onset 不足 1 拍时用其全部
+    # 时长(offset=0, 首 tap 即首个 onset); 超过 2 拍的部分封顶并入 offset(见上)。
+    m0_beats = first_ms / beat_ms if beat_ms > 1e-6 else float(kept[0])
+    if m0_beats >= 1.0:
+        m0_beats = min(float(int(m0_beats)), 2.0)
+    raw_offset = max(0.0, first_ms - m0_beats * beat_ms)
+    # 拍数 magnitudes: m_0 + 各弧真实间隔拍数(2026-08-13 原则: 间隔=真实时值,
+    # 计时不变式由此严格成立 —— 引擎按 m*180 还原时长, 踩点零误差)。
+    magnitudes = [float(m0_beats)]
+    for k in range(1, len(kept)):
+        df = kept[k] - kept[k - 1]
+        seg_sec = max(0.0, df) * hop_ms / 1000.0
+        magnitudes.append(seg_sec / med_sec)
 
     # 方向(左/右)：左/右转音频完全相同，模型学不到，由几何路径规划指派。
     # Twirl：由「音乐重音 twirl_desire(onset 包络强度) + 模型 C2(弱偏置)」驱动，
@@ -492,60 +676,61 @@ def dense_to_adofai(dense, global_bpm=120.0, hop_ms=HOP_MS, song="generated.mp3"
     model_twirl_per_tile = None
     if twirl_desire is not None:
         td_len = len(twirl_desire)
+        # twirl_desire 是按「帧号」索引的数组(与 dense[2] 同维, 长度=时间帧 T),
+        # 而 kept 存放的是 onset 帧号; 故第 k 个 onset 的驱动应取 twirl_desire[kept[k]]
+        # (帧号索引), 而非 twirl_desire[k] (序号)。旧版用序号 k 导致驱动错位 -> Twirl 几乎为 0
+        # (2026-08-23 修复: 此处与 inference 传 dense[2] 的帧号语义对齐)。
+        # 槽位对齐(2026-10 重构): 重音 k 的 Twirl 必须挂在【踩中该重音的 tile k+1】上
+        # (触发时刻 nt[k] = kept[k]*hop_ms, 与重构前的绝对触发时刻完全一致), 即驱动放
+        # magnitudes 索引 k+1 = 离开 tile k+1 的弧。索引 0 是 count-in 出生弧(无重音,
+        # 且 plan_path_twirl 本就禁止 tile0 翻转)置 0; 末位重音的弧不在规划范围, 弃用。
         twirl_desire_per_tile = np.array(
-            [float(twirl_desire[f]) if 0 <= f < td_len else 0.0 for f in kept],
+            [0.0] + [float(twirl_desire[kept[k]]) if 0 <= kept[k] < td_len else 0.0
+                     for k in range(len(kept) - 1)],
             dtype=np.float32)
         if C >= 3:
             twirl_ch = dense[2]
             cl = twirl_ch.shape[0]
             model_twirl_per_tile = np.array(
-                [float(twirl_ch[f]) if 0 <= f < cl else 0.0 for f in kept],
+                [0.0] + [float(twirl_ch[kept[k]]) if 0 <= kept[k] < cl else 0.0
+                         for k in range(len(kept) - 1)],
                 dtype=np.float32)
 
-    # 先按【转换器】算每格转角幅度(确定性, 不塌缩/不错位)。
-    # 关键修复(2026-08-13): 之前为"消除漂移"把每格强行锁成 med_sec(=1拍) -> magnitude
-    # 恒=180° -> 路径全程直线(不拐弯)、aux[2] 恒定 -> VFXNet 输入无起伏 -> 特效塌到 6 个。
-    # 现恢复用【实际 onset 间隔 df】算转角幅度: 转角随音乐真实间隔变化 -> 路径自然蜿蜒;
-    # 且每格时长=AngleToTime(magnitude)=真实间隔(ms), 与音乐逐拍精确对齐, 不漂移——
-    # 漂移真凶是旧版 round 去重删拍(已 by v3 修复), 而非用实际间隔, 故恢复安全。
-    magnitudes = []
-    for k, f in enumerate(kept):
-        if k < len(kept) - 1:
-            df = kept[k + 1] - kept[k]
-        else:
-            df = (kept[k] - kept[k - 1]) if len(kept) > 1 else 1
-        seg_sec = max(0.0, df) * hop_ms / 1000.0
-        beats = seg_sec * float(global_bpm) / 60.0
-        magnitude = beats * 180.0
-        magnitudes.append(magnitude)
     # —— 摆形状模型：用模型决定每格左右(取代纯几何贪心) ——
     # turn_sign 优先用外部传入；否则若给了模型+onset 概率，则在此推断。
+    # 2026-08-23 升级: 传入 magnitudes, 使几何上下文通道(8~11)在推理期也有真值,
+    # 模型才能基于"当前几何状态"决定往左/往右, 真正接管走向(而非和贪心一样)。
     turn_sign_arg = turn_sign
     if turn_sign_arg is None and shape_model is not None and onset_prob is not None:
         try:
             from shape_model import extract_tile_features, predict_turn_sign
             _se = stem_energy if stem_energy is not None else np.zeros((6, len(onset_prob)), np.float32)
-            _feats = extract_tile_features(kept, onset_prob, _se, float(global_bpm), hop_ms)
-            if _feats.shape[0] >= 2:
+            _feats = extract_tile_features(kept, onset_prob, _se, float(global_bpm), hop_ms,
+                                           magnitudes=magnitudes)
+            if _feats.shape[0] >= 2 and _feats.shape[1] == 12:
                 turn_sign_arg = predict_turn_sign(shape_model, _feats,
                                                   device if device else "cpu")
+            else:
+                print(f"[shape] 特征维度异常({_feats.shape}), 退回几何贪心")
+                turn_sign_arg = None
         except Exception as e:
             print(f"[shape] 转向推断失败, 退回几何贪心: {e}")
             turn_sign_arg = None
 
-    # —— 走线：模型接管 -> 豪放自由走线(B 方案); 否则几何贪心回退 ——
+    # —— 走线：踩点驱动反推框架(2026-08-22 重写) ——
+    # magnitudes 传【每格真实时值(拍数)】, plan_path_twirl 反推绝对角 + Twirl 镜像。
+    # 有 turn_sign(模型接管)时模型决定每格往左/往右; 否则几何贪心(默认往左)。
     if turn_sign_arg is not None:
-        # 修正(2026-08-15): 之前走 plan_freeform_path 每格累 12°(螺旋)+每格 SetSpeed,
-        # 既糊成一团又塞满 SetSpeed(用户明确不要)。现改回计时闭式 plan_path_twirl:
-        # 角度按"间隔×180/拍长"锁死每格时长(踩点精确, 无需 SetSpeed), 模型只决定拐左/拐右,
-        # 几何约束(不自交/不出屏/Twirl间隔)保证球平时直行、到转角才拐 -> 真实 ADOFAI 走法。
         angleData, shape_twirls = plan_path_twirl(
             magnitudes,
             twirl_desire=twirl_desire_per_tile,
             model_twirl=model_twirl_per_tile,
             turn_sign=turn_sign_arg,
         )
-        actions = [{"floor": int(f) + 1, "eventType": "Twirl"} for f in shape_twirls]
+        # 原生 .adofai floor 即 0-based tile 序号(ADOFAI-JS/AutoCat 源码证实,
+        # 见 timing_engine 事件循环注释): plan_path_twirl 返回 0-based tile 索引
+        # i, 直接发射 floor=i, 引擎/游戏读回 parsed[i]=离开 tile i 的弧, 恰好兑现规划。
+        actions = [{"floor": int(f), "eventType": "Twirl"} for f in shape_twirls if int(f) > 0]
     else:
         angleData, twirls = plan_path_twirl(
             magnitudes,
@@ -553,29 +738,56 @@ def dense_to_adofai(dense, global_bpm=120.0, hop_ms=HOP_MS, song="generated.mp3"
             model_twirl=model_twirl_per_tile,
             turn_sign=None,
         )
-        # 把规划出的 Twirl 写成事件（plan_path_twirl 返回 0-based tile 下标，
-        # ADOFAI floor 为 1-based，故 +1：tile 索引 0 对应第一格 floor 1）。
-        # plan_path_twirl 保证 tile 0 永不 Twirl，故 floor 1（首格）永不带 Twirl。
-        actions = [{"floor": int(f) + 1, "eventType": "Twirl"} for f in twirls]
+        # 把规划出的 Twirl 写成事件（plan_path_twirl 返回 0-based tile 索引 i,
+        # 原生 floor 即 0-based -> 直接发射 floor=i)。tile0 永不放 Twirl(见
+        # plan_path_twirl 的 `flip and i>0`)，此处再防御性过滤。
+        actions = [{"floor": int(f), "eventType": "Twirl"} for f in twirls if int(f) > 0]
 
     settings = {
         "bpm": float(global_bpm), "pitch": 100, "offset": 0, "song": song,
         "songArtist": "", "songName": song, "difficulty": 1, "volume": 100,
         "audioOffset": 0, "timeScale": 1.0, "mirror": 0, "flip": 0,
     }
-    # 反解 offset：令 tile 0（出生点，关卡时间=0）落在第一个 onset 帧时间。
-    # 计时链条：第 k 个 segment 时长 = (onset[k+1]-onset[k])，故 tile k 的歌曲时间
-    #   = offset + sum(seg 0..k-1) = offset + (onset[k]-onset[0])。
-    # 要让 tile k 对齐到 onset[k]，只需 offset = onset[0] = kept[0]*hop_ms。
-    # 旧公式写成 kept[0]*hop_ms - first_arrival，错误地把【tile 1】而非 tile 0 对齐到
-    # 首个 onset，使整谱相对音乐恒定早一拍(~kept[1]-kept[0]≈一个 segment)，
-    # 即"踩不到点"的实质根因；与 BPM 翻倍是并列的两大元凶。
-    raw_offset = int(round(kept[0] * hop_ms))
-    # 安全夹：极端 offset 会让整谱错位，夹到 ±3000ms。
-    settings["offset"] = max(-3000, min(3000, raw_offset))
+    # —— offset = 前奏等待(见上方 magnitudes 块推导): 关卡时钟(首格 count-in 旋转起点)
+    # 落在歌曲时间 raw_offset, 音乐从 0 播起; 加上 m_0=count-in 后 tile 1 恰踩 kept[0]。
+    # 旧版 offset=kept[0]*hop_ms(把首个 onset 当出生点) + magnitudes 从 g_0 起 —— 两者
+    # 合成"全谱踩点推后一格", 已随 2026-10 重构一并废除; ±3000 旧安全夹同废(真实语料
+    # offset 最大 42.4s, 长等待原生合法, 旧夹反而把长前奏谱整体夹错位)。
+    # —— 真相公式(2026-12, v2 点击测试 4/4 实证) ——
+    # 引擎语义: 歌曲时间 = 关卡时间 - 1拍 + offset, 即音乐在关卡时间「1拍-offset」
+    # 处开播。
+    # —— 起手角恒 0(硬性约束: 每首歌起手 angleData 必须是 0, 根据偏移调整) ——
+    # 做法: 全谱角度同减 R=angleData[0] (整体旋转坐标系, 起手格归 0=出生朝向)。
+    # 引擎计时只看相邻角差 (cur_angle-dest): 同减常数后差值不变 -> 第 2 格起所有
+    # 弧的耗时/踩点分毫不动; 唯一变化是第一格(起手弧): 引擎 cur_angle 进弧后恒
+    # 180°, 原 dest_0=180*(1-m_0) 给出 p_angle=m_0*180(=m_0 拍), 现 dest_0=0 ->
+    # p_angle 恒 180(=1 拍)。m_0=1 的经典整拍起手角度本来就是 0, 行为完全不变;
+    # m_0<1 (首 onset 不足一拍, 如 0.288 拍原起手角 128.1°) 起手弧并到 1 拍;
+    # m_0>1 时多余等待并入 offset, 引擎原生合法。
+    # 时间补偿推导(旋转后): nt_song[k] = (1+m_1+...+m_k)*beat - 1拍 + offset
+    #   = (m_1+...+m_k)*beat + offset ≡ kept[k]*hop_ms = first_ms + (m_1+...+m_k)*beat
+    #   -> offset = first_ms(=kept[0]*hop_ms, 首 onset 毫秒), 对任意 m_0 严格成立。
+    # (旧公式 offset=raw_offset+1拍 与 first_ms 恰差 (1-m_0)拍, 即起手弧时长变化量。)
+    if angleData:
+        _R = float(angleData[0])
+        if abs(_R) > 1e-9:
+            angleData = [_shortest(float(a) - _R) for a in angleData]
+    settings["offset"] = int(round(first_ms))
 
+    # 角度输出 = 采样原值(硬性约束: 取消"精度是 1 的自动吸附",
+    # 采出来是多少就是多少)。plan_path_twirl 的 angleData 本就是从每格真实
+    # 时值(拍数)精确反推的浮点绝对角, 每格 pAngle=|mag|*180 严格成立, 踩点
+    # 零量化误差 —— 不取整 = 无量化误差, 引擎计时与规划完全一致。
+    # 历史后处理在此一并停用(两个函数保留定义, 供存档参考):
+    #   _cumulative_round_diff: 累积和取整再差分, 当年修"逐角度独立 round
+    #     的量化误差随机游走"(越走越快) —— 根因正是取整本身;
+    #     现在完全不取整, 量化误差为零, 该 bug 无从发生。
+    #   _cumulative_snap(grid=1.0): 1° 吸附, 整数输入下本就是 no-op, 一并移除。
+    # (15° 吸附 2026-08-27 已取消; 1° 取整今日取消 —— 自此角度=采样原值。)
     return {
-        "angleData": [int(round(a)) for a in angleData],
+        # 原始浮点角度直出: 值域同 plan_path_twirl 输出(最短弧表示 -180~180,
+        # 引擎读入自会 mod360, 见 plan_path_twirl 内 _shortest 注释)。
+        "angleData": [float(a) for a in angleData],
         "settings": settings,
         "actions": actions,   # 阶段二:允许输出 Twirl(计时精确,不破坏踩点)
         "decorations": [],
@@ -618,7 +830,7 @@ def validate(level, timestamps, onset_idx=None, out_path=None):
 
 
 if __name__ == "__main__":
-    # 自测：构造一个小谱面，验证 (1) 幅度往返一致 (2) 方向规划产出非退化谱面
+    # 自测：(1) 往返非退化 (2) 计时不变式: 每个检测 onset 恰被一踩(nt[k]≈kept[k]帧)
     import json
     lvl = {
         "angleData": [90, -90, 180, -90, 90, -180],
@@ -630,17 +842,37 @@ if __name__ == "__main__":
     d = adofai_to_dense(lvl, T, global_bpm=120.0)
     print("dense shape:", d.shape, "onset count:", int(d[0].sum()),
           "dir unique:", np.unique(d[1]))
-    onsets = np.where(d[0] > 0.5)[0]
+    # 提取 bump 中心(局部极大, 阈值 0.9 避开高斯肩部: 肩部±1帧=0.80 也会过 0.5 阈,
+    # 且肩部间隔恰为 2 帧逃过 <2 合并 -> 双倍伪 onset); frame0 是出生格标记(非踩点)。
+    onsets = [int(f) for f in range(1, T - 1)
+              if d[0][f] > 0.9 and d[0][f] >= d[0][f - 1] and d[0][f] > d[0][f + 1]]
+    # 复刻 dense_to_adofai 内部管线(合并 <2 帧重复 + 漏拍填充), 得到对齐基准 kept
+    kept = []
+    for f in onsets:
+        if kept and (f - kept[-1]) < 2:
+            continue
+        kept.append(f)
+    kept = _fill_missing_beats(kept, HOP_MS, beat_sec=60.0 / 120.0)
+    print("onset centers:", onsets, "-> kept(合并+补拍):", kept)
     back = dense_to_adofai(d, global_bpm=120.0, onset_frames=onsets)
     ad = back["angleData"]
-    mags = [abs(a) for a in ad]
     L = sum(1 for a in ad if a < 0)   # 左转(负)数
     R = sum(1 for a in ad if a > 0)   # 右转(正)数
     print("reconstructed angleData:", ad)
-    print("magnitudes match input abs-values (±1°):",
-          np.allclose(sorted(mags), sorted([abs(x) for x in lvl["angleData"]]),
-                      atol=1.0))
     print("non-degenerate (both signs present):", L > 0 and R > 0,
           f"(L={L}, R={R})")
     print("offset:", back["settings"]["offset"])
-    print("OK plan_directions round-trip")
+    # 不变式1: 每 onset 一格(首拍不被出生格吞掉)
+    print("tile count == kept count:", len(ad) == len(kept),
+          f"(adN={len(ad)}, kept={len(kept)})")
+    # 不变式2: 引擎回算, 第 k 个 tap(nt[k]) 恰落在第 k 个 onset 上
+    # (旧版 nt[k]≈kept[k+1]: 首拍踩空+尾部幻影拍 -> 踩点整体推后一格)
+    nt = compute_note_times(ad, back["settings"], back["actions"], add_offset=True)
+    errs = [abs(nt[k][0] - kept[k] * HOP_MS) for k in range(len(kept))]
+    max_err = max(errs) if errs else 0.0
+    first_err = errs[0] if errs else 0.0
+    print(f"per-onset tap max_err={max_err:.2f}ms, first-tap err={first_err:.2f}ms",
+          "OK" if max_err < 40.0 else "FAIL")
+    # 不变式3: 起手角恒 0 (硬性约束: 每首歌第一个 angleData 必须是 0)
+    print("first angle == 0:", ad[0] == 0.0, f"(ad[0]={ad[0]!r})")
+    print("OK dense_to_adofai round-trip")

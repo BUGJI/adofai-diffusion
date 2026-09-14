@@ -1,7 +1,7 @@
 """
 train_vfx.py — VFXNet 训练（重写版：配合稀疏 / 精选标签）
 
-数据：D:/ADOFAI_AI_Mug/vision/best（用户精选谱面）
+数据：项目根/train_vfx（每子文件夹一首：.adofai + 音频配对；可用 --data 覆盖）
 目标缓存：extract_vfx.py 产出的 data/vfx_cache/*.npz（multi/params/filt/aux）
 
 设计哲学（与旧版的根本区别）
@@ -26,7 +26,8 @@ train_vfx.py — VFXNet 训练（重写版：配合稀疏 / 精选标签）
 设备：get_safe_device()（老显卡自动退回 CPU）。
 
 用法：
-  python train_vfx.py --data D:/ADOFAI_AI_Mug/vision/best --cache data/vfx_cache --epochs 60
+  python train_vfx.py --data "<视觉数据根: 每子文件夹一首 .adofai+音频>" --epochs 60
+  (--data/--cache 缺省为 项目根/train_vfx 与 项目根/data/vfx_cache)
 （注意：本脚本只写训练逻辑。运行前需先用 extract_vfx.py 重新生成 vfx_cache。）
 """
 from __future__ import annotations
@@ -52,6 +53,7 @@ from vfx_net import VFXNet
 # rotation 等真实物理量）。此处断言维度一致，避免标签与模型错位。
 from effects_schema import (P as SCHEMA_P, build_action as _schema_build,
                              FILTER_TYPES, EASING, N_EASINGS)
+from paths import train_ckpt_dir
 
 CHUNK = 4096          # 必须被 16 整除（若将来接 VAE 下采样）；此处仅切块
 STRIDE = 3072
@@ -199,13 +201,15 @@ def train(best_dir, cache_dir, epochs=60, batch=8, lr=1e-3, device="cpu"):
     assert P == SCHEMA_P, f"param_dim 必须与 effects_schema 一致({SCHEMA_P})，现为 {P}"
     pos_weight = compute_pos_weight(ds).to(device)
     print(f"[vfx] pos_weight: {['%.1f' % x for x in pos_weight.tolist()]}")
-    dl = td.DataLoader(ds, batch_size=batch, shuffle=True, num_workers=4,
+    # Windows 上 num_workers>0 走共享内存映射缓存块，264 首×6 通道 mel 太大，
+    # 页面文件耗尽报 error 1455（实测崩过）。改单进程加载：数据在 OS 页缓存里，喂 GPU 足够快。
+    dl = td.DataLoader(ds, batch_size=batch, shuffle=True, num_workers=0,
                        pin_memory=True, drop_last=False)
     model = VFXNet(n_events=V, n_filters=N_FILTERS, n_easings=N_EASINGS,
                    param_dim=P).to(device)
     # 续训：优先从最近一轮的 epoch 检查点接（防中途崩了从头重来）；否则加载 vfx_net.pt 作初始化
-    ckpt_dir = os.path.join(os.environ.get("ADOFAI_DATA_DIR",
-                     str(ROOT / "data")), "checkpoints")
+    # 输出目录统一走 train_ckpt_dir()（运行时目录优先，便携 data/checkpoints 只放出厂数）
+    ckpt_dir = str(train_ckpt_dir())
     os.makedirs(ckpt_dir, exist_ok=True)
     start_ep = 0
     ep_ckpts = sorted(glob.glob(os.path.join(ckpt_dir, "vfx_net_ep*.pt")),
@@ -288,8 +292,7 @@ def train(best_dir, cache_dir, epochs=60, batch=8, lr=1e-3, device="cpu"):
         torch.save(model.state_dict(), ep_ckpt)
         torch.save(model.state_dict(), os.path.join(ckpt_dir, "vfx_net.pt"))
         print(f"[vfx] 已保存检查点 -> {ep_ckpt}（及 vfx_net.pt）", flush=True)
-    out = os.path.join(os.environ.get("ADOFAI_DATA_DIR",
-                     str(ROOT / "data")), "checkpoints", "vfx_net.pt")
+    out = os.path.join(str(train_ckpt_dir()), "vfx_net.pt")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     torch.save(model.state_dict(), out)
     print(f"[vfx] 已保存权重 -> {out}")
@@ -297,8 +300,10 @@ def train(best_dir, cache_dir, epochs=60, batch=8, lr=1e-3, device="cpu"):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default=r"D:/ADOFAI_AI_Mug/vision/best")
-    ap.add_argument("--cache", default=r"D:/ADOFAI_AI_Mug/new_last_128/portable/data/vfx_cache")
+    ap.add_argument("--data", default=str(ROOT / "train_vfx"),
+                    help="视觉训练数据根(每子文件夹一首: .adofai+音频); 缺省 项目根/train_vfx")
+    ap.add_argument("--cache", default=os.path.join(str(ROOT), "data", "vfx_cache"),
+                    help="事件目标缓存目录; 缺省 项目根/data/vfx_cache")
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--batch", type=int, default=12)
     ap.add_argument("--lr", type=float, default=1e-3)

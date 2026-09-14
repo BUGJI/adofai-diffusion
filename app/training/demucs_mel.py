@@ -38,6 +38,7 @@ if str(ROOT) not in sys.path:
 
 from chart_repr import SR, HOP  # 22050, 128(本路径全局, 踩点+扩散同网格)
 from device_util import get_safe_device
+from paths import DEMUCS_CACHE_DIR  # 跟随 ADOFAI_DATA_DIR（网页/GUI=运行时目录），未设置时为便携 data/
 
 N_MELS = 128
 N_FFT = 2048
@@ -49,7 +50,7 @@ HOP_MS_ONSET = 1000.0 * HOP_ONSET / SR          # ≈ 5.805 ms
 STEMS = ["drums", "bass", "other", "vocals", "full", "accomp"]
 # 老显卡(如 GTX 10 系) torch.cuda.is_available() 会假阳性，必须用一次真实内核探测
 DEVICE = get_safe_device()
-CACHE_DIR = os.path.join(ROOT.parent, "data", "demucs_cache")
+CACHE_DIR = str(DEMUCS_CACHE_DIR)
 
 _SEP = None  # (model, apply_model)
 
@@ -59,7 +60,11 @@ def _get_sep(device):
     if _SEP is None:
         from demucs.pretrained import get_model
         from demucs.apply import apply_model
-        m = get_model("htdemucs")
+        import demucs
+        # 离线加载：把 demucs 自带的 remote 目录作为本地 repo 传入，
+        # 避免 get_model 默认走 HuggingFace hub（HF 不通时会卡死重试）。
+        _remote = Path(demucs.__file__).resolve().parent / "remote"
+        m = get_model("htdemucs", repo=_remote)
         m.to(device).eval()
         _SEP = (m, apply_model)
     return _SEP
@@ -102,8 +107,30 @@ def demucs_mel(audio_path, device=None, fallback=True):
     """
     device = device or DEVICE
     cp = _cache_path(audio_path)
+    # 先算当前音频样本数 L（仅 load 元数据级，librosa 解码首步），用于校验缓存 mel 长度。
+    # 防止复用「半长/错长」的陈旧缓存 mel（旧代码或中断导致的损坏帧数），
+    # 否则 apply_vfx 会把后半段音符的帧索引 clamp 到末帧 -> 特效只在谱面前半段出现。
+    _exp_T = None
+    try:
+        import soundfile as _sf
+        with _sf.SoundFile(audio_path) as _f:
+            _frames = _f.frames
+            _sr0 = _f.samplerate
+        _exp_T = int(round(_frames * SR / float(_sr0)) // HOP_ONSET) + 2
+    except Exception:
+        _exp_T = None
     if cp and os.path.exists(cp):
-        return np.load(cp)
+        try:
+            _m = np.load(cp)
+            if _m.ndim == 3 and _m.shape[0] == len(STEMS) and _m.shape[1] == N_MELS:
+                if _exp_T is None or abs(_m.shape[2] - _exp_T) <= max(8, int(_exp_T * 0.02)):
+                    return _m
+                else:
+                    print(f"[demucs] 缓存 mel 帧数={_m.shape[2]} 与当前音频期望≈{_exp_T} 不符，重新分离")
+            else:
+                print(f"[demucs] 缓存 mel 形状异常 {_m.shape}，重新分离")
+        except Exception as e:
+            print(f"[demucs] 缓存读取失败({e})，重新分离")
 
     try:
         # 原始混合 @ 22050 单声道（作为 full/accomp 通道 + 长度基准 L）
@@ -122,6 +149,8 @@ def demucs_mel(audio_path, device=None, fallback=True):
         x = torch.from_numpy(y44).float().to(device)
         with torch.no_grad():
             sources = apply_model(model, x[None], device=device, progress=False)[0]  # (nsrc,2,N)
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
         names = list(model.sources)  # ['drums','bass','other','vocals']
 
         # 先把需要的 stem 重采样到 22050 并对齐到 L

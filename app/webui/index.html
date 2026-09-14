@@ -134,6 +134,17 @@
       <div class="hint" style="margin-bottom:10px">在已成谱面上叠加纯视觉特效（闪光 Flash / 泛光 Bloom / 镜头 MoveCamera / 滤镜 SetFilter / 变色 RecolorTrack）。特效与<b>音乐结构强相关</b>（节拍/掉落/乐句），由 VFXNet 预测。需先完成 VFXNet 训练（见「训练视觉特效」页）。</div>
       <div class="row" style="margin-bottom:10px;justify-content:space-between">
         <label class="stem-label"><input id="vfx_on" type="checkbox"> 生成时加入视觉特效</label>
+        <label class="stem-label" style="margin-top:8px;display:block">
+          <input id="dual_block" type="checkbox" checked> 同音多采拦截（合并同一节奏点的连发伪踩点；关掉则原样保留，可能糊）
+        </label>
+        <label class="stem-label" style="margin-top:8px;display:block">
+          踩点模式（本曲是否有人声）：
+          <select id="onset_mode">
+            <option value="auto">自动（不确定就选这个，默认）</option>
+            <option value="vocal">有人声（流行 / 动漫 / 说唱等带人声的歌）</option>
+            <option value="melody">无人声（钢琴曲 / 轻音乐 / 电子纯音乐）</option>
+          </select>
+        </label>
       </div>
       <div class="note" id="vfxPending" style="margin-top:10px"></div>
     </div>
@@ -207,14 +218,22 @@
   <section id="trainView" hidden>
     <div class="card">
       <div class="note">
-        训练数据目录：放你的「歌曲 + 谱面」配对，每个子文件夹一首歌（如 <code>train/歌手 - 歌名/歌名.ogg</code> + <code>歌名.adofai</code>）。
-        程序会同时训两个模型：<b>OnsetNet（踩点）</b> 和 <b>VAE+扩散（加事件）</b>。
+        你要训练的是 <b>踩点模型（OnsetNet）</b>。选好目标（默认综合 / 旋律 / 人声），把对应歌曲 + 谱面放进对应文件夹即可，<b>无需手动填路径</b>。
       </div>
       <div class="ctrl">
-        <label>训练数据目录</label>
-        <input id="data_dir" type="text" value="D:/Users/Windows/Desktop/train"
-               style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:9px 10px;font:inherit">
-        <div class="hint">双击路径可修改。建议用你最满意的谱面配对当训练集（越多越像你的风格）。</div>
+        <label>要训练的踩点模型</label>
+        <select id="train_target" style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:9px 10px;font:inherit">
+          <option value="default">默认综合模型（melody+vocal 双目录全量训练 → onset_net.pt）</option>
+          <option value="melody">旋律模型（纯器乐：钢琴曲 / 轻音乐 / 电子纯音…）</option>
+          <option value="vocal">人声模型（带人声的歌：流行 / 动漫 / 说唱…）</option>
+        </select>
+        <div class="hint">
+          把歌曲 + 谱面配对放进对应文件夹，每首一个子文件夹（歌曲.ogg/mp3 + 歌曲.adofai）：<br>
+          · 默认综合模型 → <code>train_single/melody/</code> + <code>train_single/vocal/</code> 两目录全量（264 首）<br>
+          · 旋律模型 → <code>train_single/melody/</code><br>
+          · 人声模型 → <code>train_single/vocal/</code><br>
+          全部从零训练（新时间轴公式，2026-12 实证修复后旧权重不适用，需全部重训）。
+        </div>
       </div>
       <div class="grid" style="margin-top:12px">
         <div class="ctrl">
@@ -222,16 +241,16 @@
           <input id="onset_epochs" type="number" min="1" max="500" step="1" value="80">
         </div>
         <div class="ctrl">
-          <label>VAE 轮数</label>
-          <input id="vae_epochs" type="number" min="1" max="500" step="1" value="60">
+          <label>VAE 轮数（风格·通用）</label>
+          <input id="vae_epochs" type="number" min="0" max="500" step="1" value="60">
         </div>
         <div class="ctrl">
-          <label>扩散 DDPM 轮数</label>
-          <input id="ddpm_epochs" type="number" min="1" max="1000" step="1" value="120">
+          <label>扩散 DDPM 轮数（风格·通用）</label>
+          <input id="ddpm_epochs" type="number" min="0" max="1000" step="1" value="120">
         </div>
       </div>
       <div class="row" style="margin-top:12px">
-        <label class="stem-label"><input id="finetune_on" type="checkbox"> 微调模式（从已有 onset_net.pt 继续训，保留其他歌能力；输出 onset_net_finetune.pt，不覆盖原权重）</label>
+        <div class="hint">VAE / 扩散训的是 <b>通用风格</b>（不分人声旋律），用同一批谱面即可。只想改踩点就只点「只训踩点模型」，或把 VAE / DDPM 轮数设 <b>0</b> 跳过。</div>
       </div>
       <div class="row" style="margin-top:14px">
         <button id="trainAll" class="primary">一键全训（推荐）</button>
@@ -261,9 +280,9 @@
       </div>
       <div class="ctrl">
         <label>视觉训练数据目录</label>
-        <input id="vfx_data_dir" type="text" value="D:/ADOFAI_AI_Mug/vision/best"
+        <input id="vfx_data_dir" type="text" value="train_vfx"
                style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:9px 10px;font:inherit">
-        <div class="hint">双击修改。每个子文件夹一首歌（含 .adofai 与音频配对）。默认已指向你整理的精选视觉语料 <code>vision/best</code>。</div>
+        <div class="hint">双击修改。每个子文件夹一首歌（含 .adofai 与音频配对）。默认为项目根下 <code>train_vfx</code>，也可填绝对路径。</div>
       </div>
       <div class="grid" style="margin-top:12px">
         <div class="ctrl">
@@ -324,10 +343,11 @@
         (d.models || []).forEach(m=>{
           const chip = document.createElement('div');
           chip.className = 'chip ' + (m.present ? 'ok' : 'miss');
+          const srcTag = m.present && m.source ? ` · ${m.source}` : '';
           chip.innerHTML =
             `<span class="nm">${m.label}</span>` +
             `<span class="st">${m.present ? '✅ 已就绪' : '⚠️ 缺失'}</span>` +
-            `<span class="sz">${m.present ? m.size_mb + ' MB' : m.file}</span>`;
+            `<span class="sz">${m.present ? m.size_mb + ' MB' + srcTag : m.file}</span>`;
           ms.appendChild(chip);
         });
       }
@@ -335,8 +355,8 @@
       if(sum){
         sum.style.borderLeftColor = d.all_ready ? 'var(--ok)' : 'var(--warn)';
         sum.innerHTML = d.all_ready
-          ? '✅ 全部模型权重已就绪，可直接生成谱面（含视觉特效）。'
-          : '⚠️ 部分模型权重缺失，生成可能失败。请到「训练模型」/「训练视觉特效」页补齐权重后刷新本页。';
+          ? '✅ 核心模型（OnsetNet / VAE / 扩散）已就绪，可直接生成谱面。其余为可选增强（分轨踩点 / 视觉特效 / 摆形状）。'
+          : '⚠️ 核心模型权重缺失，生成会失败。请先到「训练模型」页训练（或恢复出厂 data/checkpoints 权重）后刷新本页。';
       }
       // VFX 提示动态化
       const vfx = (d.models || []).find(m => m.file === 'vfx_net.pt');
@@ -478,7 +498,9 @@
       const params = { difficulty: +$('difficulty').value,
         bpm: (bpmRaw==='' ? '' : (+bpmRaw)),
         selected: selected,
-        vfx: $('vfx_on').checked };
+        onset_mode: $('onset_mode').value,
+        vfx: $('vfx_on').checked,
+        dual_block: $('dual_block').checked };
       const buf = await selectedFile.arrayBuffer();
       const resp = await fetch('/api/generate?name='+encodeURIComponent(selectedFile.name), {
         method:'POST', headers:{'X-Settings':JSON.stringify(params)}, body:buf });
@@ -526,12 +548,11 @@
   }
 
   async function startTrain(kind){
-    const data_dir = $('data_dir').value.trim();
-    const payload = { kind, data_dir,
+    const payload = { kind,
+      train_target: $('train_target').value,
       onset_epochs: +$('onset_epochs').value,
       vae_epochs: +$('vae_epochs').value,
-      ddpm_epochs: +$('ddpm_epochs').value,
-      finetune_on: $('finetune_on').checked };
+      ddpm_epochs: +$('ddpm_epochs').value };
     $('trainStatus').textContent='请求中…';
     try{
       const r = await fetch('/api/train_start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
