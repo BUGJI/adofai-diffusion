@@ -61,61 +61,40 @@ docker compose up -d --build
 
 ---
 
-## 二、目录结构
-
-```
-adofai-diffusion/
-├── app/                        # 全部核心源码
-│   ├── web_server.py           # ★ 入口：零依赖 http.server 后端（生成/分离/训练 API）
-│   ├── paths.py                # ★ 路径与权重解析的唯一真相
-│   ├── onset_detector.py       # 频谱通量 onset 检测（预览图）
-│   ├── adofai_parse.py         # 宽容解析 .adofai（BOM / 尾逗号 / pathData）
-│   ├── timing_engine.py        # ADOFAI 计时引擎忠实移植（SharpFAI GetNoteTimes）
-│   ├── effects_schema.py       # 视觉特效字段唯一真相源（转录自 ADOFAI-JS）
-│   ├── webui/                  # 网页版前端（index.html / vfx_train.html / shape_monitor.html）
-│   └── training/               # 模型定义 / 训练 / 推理
-│       ├── inference_stage2.py # ★ 生成主链路（web_server 以子进程调用）
-│       ├── chart_repr.py       # 稠密谱面 ↔ .adofai 落谱 + 路径规划
-│       ├── apply_vfx.py        # VFX 注入
-│       └── train_*.py          # onset / stage2(vae+ddpm) / shape / vfx
-├── gui/                        # 原生 GUI 壳（Windows：Win32 Mica 窗口 + WebView2）
-├── data/checkpoints/           # 出厂权重（7 个 .pt）
-├── torch_hub/                  # beat_this 的 ONSET 权重（免首跑联网）
-├── train_data/                 # ← 训练数据放这里（见第六节）
-├── requirements.txt            # GPU/CPU 通用（torch 默认 cu128 轮子）
-├── requirements-cpu.txt        # 纯 CPU 环境（配合 pytorch cpu 索引）
-├── Dockerfile / docker-compose.yml
-└── run旧版网页端.bat           # Windows 网页端启动器
-```
-
----
-
-## 三、生成流水线（`app/training/inference_stage2.py`）
-
-全链路统一 **hop=128 网格（≈5.805 ms/帧 @22050 Hz）**，踩点 / 扩散 / 落谱共用同一网格，无换算：
-
-```
-音频 → ffmpeg/librosa 解码
-  ├─ Demucs(htdemucs) 分离 6 通道 mel：drums/bass/other/vocals/full/accomp
-  ├─ [可选] Beat This! (ISMIR 2024) 估 BPM / 节拍相位条件
-  ├─ OnsetNet(CNN+BiGRU) 踩点 → onset 帧（分轨模式：选中轨复制填充 6 通道）
-  ├─ full-mix mel + onset 包络 → DDPM(CFG 2.5, 25~50 步, 分块 4096 帧)
-  │     → VAE 潜空间(16ch, T/16) 采样 → 解码回 (3,T) 稠密谱面
-  ├─ dense_to_adofai 落谱：
-  │     每格时值(拍数) = onset 间隔 → plan_path_twirl 反推绝对角
-  │     （pAngle = 拍数×180，踩点零误差；Twirl 由重音 + 模型 C2 打分决策）
-  │     方向(左/右) 由 ShapeModel(12 维特征含几何上下文) 或几何贪心决定
-  └─ [可选] apply_vfx：VFXNet 帧级预测吸附到方块，注入 19 类视觉事件
-→ .adofai（回填 songName/songFilename、轨道淡入淡出、offset = 首个 onset）
-```
-
-界面上的开关：
+## 二、界面开关说明
 
 | 开关 | 含义 |
 |---|---|
 | 视觉特效 (VFX) | 默认关闭。开启后注入 MoveTrack/Flash/SetFilter… 等事件 |
 | 同音多采拦截 | 默认开启。合并过密的同音 onset（35 ms 内成簇、70 ms 内串联），避免同一音被判成多踩 |
 | 分轨模式 | 用 melody / vocal 专用 OnsetNet，并只喂对应声源的 mel |
+
+---
+
+## 三、训练
+
+数据格式：**每首歌一个子目录，音频与谱面同名配对**：
+
+```
+train_data/
+└── 歌名A/
+    ├── 歌名A.ogg
+    └── 歌名A.adofai
+```
+
+```bash
+# 踩点模型
+python app/training/train_onset.py --train_dir train_data
+# 风格层（VAE + DDPM），数据目录用 env 指定
+ADOFAI_TRAIN_DIR=train_data python app/training/train_stage2.py
+# 摆形状模型
+python app/training/train_shape.py --data train_data
+# 特效模型
+python app/training/train_vfx.py --data train_data --cache train_data/.vfx_cache
+```
+
+产物默认进运行时目录 `checkpoints/`，网页端和 GUI 的训练页签有实时日志监控。
+GPU 显存不够时，`train_stage2.py` 支持用 `VAE_EPOCHS` / `DDPM_EPOCHS` 控制轮数。
 
 ---
 
@@ -165,34 +144,57 @@ adofai-diffusion/
 
 ---
 
-## 六、训练
-
-数据格式：**每首歌一个子目录，音频与谱面同名配对**：
+## 六、目录结构
 
 ```
-train_data/
-└── 歌名A/
-    ├── 歌名A.ogg
-    └── 歌名A.adofai
+adofai-diffusion/
+├── app/                        # 全部核心源码
+│   ├── web_server.py           # ★ 入口：零依赖 http.server 后端（生成/分离/训练 API）
+│   ├── paths.py                # ★ 路径与权重解析的唯一真相
+│   ├── onset_detector.py       # 频谱通量 onset 检测（预览图）
+│   ├── adofai_parse.py         # 宽容解析 .adofai（BOM / 尾逗号 / pathData）
+│   ├── timing_engine.py        # ADOFAI 计时引擎忠实移植（SharpFAI GetNoteTimes）
+│   ├── effects_schema.py       # 视觉特效字段唯一真相源（转录自 ADOFAI-JS）
+│   ├── webui/                  # 网页版前端（index.html / vfx_train.html / shape_monitor.html）
+│   └── training/               # 模型定义 / 训练 / 推理
+│       ├── inference_stage2.py # ★ 生成主链路（web_server 以子进程调用）
+│       ├── chart_repr.py       # 稠密谱面 ↔ .adofai 落谱 + 路径规划
+│       ├── apply_vfx.py        # VFX 注入
+│       └── train_*.py          # onset / stage2(vae+ddpm) / shape / vfx
+├── gui/                        # 原生 GUI 壳（Windows：Win32 Mica 窗口 + WebView2）
+├── data/checkpoints/           # 出厂权重（7 个 .pt）
+├── torch_hub/                  # beat_this 的 ONSET 权重（免首跑联网）
+├── train_data/                 # ← 训练数据放这里（见第三节）
+├── requirements.txt            # GPU/CPU 通用（torch 默认 cu128 轮子）
+├── requirements-cpu.txt        # 纯 CPU 环境（配合 pytorch cpu 索引）
+├── Dockerfile / docker-compose.yml
+└── run旧版网页端.bat           # Windows 网页端启动器
 ```
-
-```bash
-# 踩点模型
-python app/training/train_onset.py --train_dir train_data
-# 风格层（VAE + DDPM），数据目录用 env 指定
-ADOFAI_TRAIN_DIR=train_data python app/training/train_stage2.py
-# 摆形状模型
-python app/training/train_shape.py --data train_data
-# 特效模型
-python app/training/train_vfx.py --data train_data --cache train_data/.vfx_cache
-```
-
-产物默认进运行时目录 `checkpoints/`，网页端和 GUI 的训练页签有实时日志监控。
-GPU 显存不够时，`train_stage2.py` 支持用 `VAE_EPOCHS` / `DDPM_EPOCHS` 控制轮数。
 
 ---
 
-## 七、关键设计决策（踩坑沉淀）
+## 七、生成流水线（`app/training/inference_stage2.py`）
+
+全链路统一 **hop=128 网格（≈5.805 ms/帧 @22050 Hz）**，踩点 / 扩散 / 落谱共用同一网格，无换算：
+
+```
+音频 → ffmpeg/librosa 解码
+  ├─ Demucs(htdemucs) 分离 6 通道 mel：drums/bass/other/vocals/full/accomp
+  ├─ [可选] Beat This! (ISMIR 2024) 估 BPM / 节拍相位条件
+  ├─ OnsetNet(CNN+BiGRU) 踩点 → onset 帧（分轨模式：选中轨复制填充 6 通道）
+  ├─ full-mix mel + onset 包络 → DDPM(CFG 2.5, 25~50 步, 分块 4096 帧)
+  │     → VAE 潜空间(16ch, T/16) 采样 → 解码回 (3,T) 稠密谱面
+  ├─ dense_to_adofai 落谱：
+  │     每格时值(拍数) = onset 间隔 → plan_path_twirl 反推绝对角
+  │     （pAngle = 拍数×180，踩点零误差；Twirl 由重音 + 模型 C2 打分决策）
+  │     方向(左/右) 由 ShapeModel(12 维特征含几何上下文) 或几何贪心决定
+  └─ [可选] apply_vfx：VFXNet 帧级预测吸附到方块，注入 19 类视觉事件
+→ .adofai（回填 songName/songFilename、轨道淡入淡出、offset = 首个 onset）
+```
+
+---
+
+## 八、关键设计决策（踩坑沉淀）
 
 - **角度由「转换器」确定性反推**（pAngle = 拍数 × 180），模型不碰角度 → 绕开绝对角度回归塌缩；
   方向（左/右）音频上不对称、学不好，交给几何规划 / ShapeModel 决定。
@@ -210,7 +212,7 @@ GPU 显存不够时，`train_stage2.py` 支持用 `VAE_EPOCHS` / `DDPM_EPOCHS` �
 
 ---
 
-## 八、已知边界
+## 九、已知边界
 
 - GUI 壳依赖 Win32/WebView2，**只有 Windows 能用**；跨平台请用网页端或 Docker。
 - CPU 推理可用但慢（一首 3 分钟的歌，分离 + 扩散约数分钟量级）。
@@ -219,7 +221,7 @@ GPU 显存不够时，`train_stage2.py` 支持用 `VAE_EPOCHS` / `DDPM_EPOCHS` �
 
 ---
 
-## 九、许可与致谢
+## 十、许可与致谢
 
 - 本项目源码采用 **MIT** 许可（见 `LICENSE`）。
 - 依赖与转录的上游项目见 `NOTICE`，各自许可仍归上游。
